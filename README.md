@@ -25,8 +25,8 @@ nix develop
 ```
 
 The shell provides the Clang/libc++ toolchain, Wild linker, clangd, LLDB, CMake,
-Ninja, nix language servers, libpqxx, and both release/debug mimalloc prefixes
-used by the CMake presets.
+Ninja, nix language servers, libpqxx, llfio, and both release/debug mimalloc
+prefixes used by the CMake presets.
 
 ### CMake presets
 
@@ -68,6 +68,10 @@ nix build .#debug --out-link result-debug
 
 The release binary links `libmimalloc.so.3`; the debug binary links
 `libmimalloc-debug.so.3`. Both are built with debug info and are not stripped.
+
+`libpqxx` and `llfio` are separate Nix derivations pinned by flake inputs, so
+normal source changes and version bumps in this project do not rebuild those
+dependencies from scratch.
 
 ### Zed and LLDB
 

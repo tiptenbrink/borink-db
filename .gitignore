@@ -3,6 +3,9 @@ build-debug/
 result
 result-debug
 result-release
+result-quickcpplib
+result-outcome
+result-llfio
 
 .claude/
 .codex

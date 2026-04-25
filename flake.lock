@@ -17,6 +17,25 @@
         "type": "github"
       }
     },
+    "llfio-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1767903495,
+        "narHash": "sha256-o7OttswebmkU8mqaKQx7bSVD4rqKQT4Jb+AhcvZF8PI=",
+        "ref": "refs/heads/develop",
+        "rev": "b3c9308f143e27161c40f6d52a8fd18e8f05761b",
+        "revCount": 1529,
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/ned14/llfio.git"
+      },
+      "original": {
+        "rev": "b3c9308f143e27161c40f6d52a8fd18e8f05761b",
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/ned14/llfio.git"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1776734388,
@@ -33,10 +52,51 @@
         "type": "github"
       }
     },
+    "outcome-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1768773525,
+        "narHash": "sha256-2uKNA6Urn92you3NpggfXVGL4DM66C3aAnclDZA/vTs=",
+        "ref": "refs/heads/develop",
+        "rev": "2db94be7aa1c65115d1942042238317d53ab601c",
+        "revCount": 2477,
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/ned14/outcome.git"
+      },
+      "original": {
+        "rev": "2db94be7aa1c65115d1942042238317d53ab601c",
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/ned14/outcome.git"
+      }
+    },
+    "quickcpplib-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1773172646,
+        "narHash": "sha256-KK3jwjVicy9hgwg5pAGE+WLkeOruvJaQ7yPwx1EzD94=",
+        "ref": "refs/heads/master",
+        "rev": "3c1d8cb5e94722447e4f17e87b5a9e3a0c66fb39",
+        "revCount": 834,
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/ned14/quickcpplib.git"
+      },
+      "original": {
+        "rev": "3c1d8cb5e94722447e4f17e87b5a9e3a0c66fb39",
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/ned14/quickcpplib.git"
+      }
+    },
     "root": {
       "inputs": {
         "libpqxx-src": "libpqxx-src",
-        "nixpkgs": "nixpkgs"
+        "llfio-src": "llfio-src",
+        "nixpkgs": "nixpkgs",
+        "outcome-src": "outcome-src",
+        "quickcpplib-src": "quickcpplib-src"
       }
     }
   },
