@@ -90,13 +90,31 @@
         "url": "https://github.com/ned14/quickcpplib.git"
       }
     },
+    "reflect-cpp-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1770958922,
+        "narHash": "sha256-oi63kqm6QRmKR6P7o7oOwaRicu8CuJsrwOVxVz9UDuU=",
+        "owner": "getml",
+        "repo": "reflect-cpp",
+        "rev": "c2ab61a200e69fd31424a19c6c14e28ee5ea4018",
+        "type": "github"
+      },
+      "original": {
+        "owner": "getml",
+        "repo": "reflect-cpp",
+        "rev": "c2ab61a200e69fd31424a19c6c14e28ee5ea4018",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "libpqxx-src": "libpqxx-src",
         "llfio-src": "llfio-src",
         "nixpkgs": "nixpkgs",
         "outcome-src": "outcome-src",
-        "quickcpplib-src": "quickcpplib-src"
+        "quickcpplib-src": "quickcpplib-src",
+        "reflect-cpp-src": "reflect-cpp-src"
       }
     }
   },

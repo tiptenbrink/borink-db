@@ -3,9 +3,12 @@ build-debug/
 result
 result-debug
 result-release
+result-flatbuffers
+result-msgpack-c
 result-quickcpplib
 result-outcome
 result-llfio
+result-reflect-cpp
 
 .claude/
 .codex

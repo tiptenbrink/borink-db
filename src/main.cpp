@@ -3,8 +3,15 @@
 
 #include <llfio/llfio.hpp>
 #include <pqxx/pqxx>
+#include <rfl/msgpack.hpp>
 
 namespace {
+struct ConfigChange {
+    std::string user;
+    std::string key;
+    int revision;
+};
+
 bool smoke_test_llfio(std::string_view executable_path) {
     namespace llfio = LLFIO_V2_NAMESPACE;
 
@@ -39,12 +46,36 @@ bool smoke_test_llfio(std::string_view executable_path) {
     std::cout << "llfio smoke-test OK: executable starts with ELF magic\n";
     return true;
 }
+
+bool smoke_test_msgpack() {
+    const ConfigChange input{
+        .user = "smoke",
+        .key = "msgpack",
+        .revision = 1,
+    };
+
+    const auto bytes = rfl::msgpack::write(input);
+    const auto output = rfl::msgpack::read<ConfigChange>(bytes);
+    if (!output) {
+        std::cerr << "reflect-cpp msgpack smoke-test failed: " << output.error().what() << '\n';
+        return false;
+    }
+
+    const auto &value = output.value();
+    if (value.user != input.user || value.key != input.key || value.revision != input.revision) {
+        std::cerr << "reflect-cpp msgpack smoke-test failed: decoded value mismatch\n";
+        return false;
+    }
+
+    std::cout << "reflect-cpp msgpack smoke-test OK: " << bytes.size() << " bytes\n";
+    return true;
+}
 }
 
 int main(int argc, char **argv) {
     std::cout << "borink-db (libpqxx " << PQXX_VERSION << ")\n";
 
-    if (argc < 1 || argv[0] == nullptr || !smoke_test_llfio(argv[0])) {
+    if (argc < 1 || argv[0] == nullptr || !smoke_test_llfio(argv[0]) || !smoke_test_msgpack()) {
         return 1;
     }
     return 0;

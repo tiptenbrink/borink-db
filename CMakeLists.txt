@@ -11,8 +11,10 @@ find_package(Threads REQUIRED)
 find_package(libpqxx CONFIG REQUIRED)
 find_package(llfio CONFIG REQUIRED)
 find_package(mimalloc CONFIG REQUIRED)
+find_package(msgpack-c CONFIG REQUIRED)
+find_package(reflectcpp CONFIG REQUIRED)
 
 add_executable(borink_db src/main.cpp src/mimalloc.cpp)
-target_link_libraries(borink_db PRIVATE libpqxx::pqxx llfio::sl mimalloc)
+target_link_libraries(borink_db PRIVATE libpqxx::pqxx llfio::sl mimalloc reflectcpp::reflectcpp)
 
 install(TARGETS borink_db RUNTIME DESTINATION bin)

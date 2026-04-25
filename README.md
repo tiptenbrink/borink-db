@@ -16,6 +16,20 @@ set_property()
 - update db
 - notify
 
+## Append file log protocol
+
+Atomicity is achieved as follows without locking, assuming <1 kB writes are indeed atomic, even on SMB shares:
+
+When making a commit, the latest status of the append log is read, giving the absolute timestamp. We generate a random commit ID and then write using O_APPEND. We then read the log again. If we are the first new write after the previous timestamp we read, then it succeeds. Later writes with a different ID and the same timestamp are ignored and will have to be retried.
+
+We only write updates less than 1kB in size. Otherwise we split them up into multiple blocks and separate writes, all with a single timestamp. Only when all blocks are appended as one continuous chunk do we accept, otherwise we count it as "failed". Note that any write or block always contain a checksum to ensure they are not corrupted.
+
+To prevent "starvation" of larger writes, an advisory "wait" block can be written. Writers that don't opt into "critical" priority will then wait/block for a moment to increase the change the big write can succeed.
+
+Note that we expect to only make small updates and there are only ever maybe 10-20 concurrent writer processes. 
+
+The timestamp is simply a monotonically increasing counter in the log. Readers skip any write with invalid checksum or half-written blocks.
+
 ## Development
 
 Use the Nix development shell for local builds and editor support:
@@ -25,8 +39,9 @@ nix develop
 ```
 
 The shell provides the Clang/libc++ toolchain, Wild linker, clangd, LLDB, CMake,
-Ninja, nix language servers, libpqxx, llfio, and both release/debug mimalloc
-prefixes used by the CMake presets.
+Ninja, nix language servers, libpqxx, llfio, msgpack-c, reflect-cpp with
+MessagePack support, and both release/debug mimalloc prefixes used by the CMake
+presets.
 
 ### CMake presets
 
@@ -69,9 +84,10 @@ nix build .#debug --out-link result-debug
 The release binary links `libmimalloc.so.3`; the debug binary links
 `libmimalloc-debug.so.3`. Both are built with debug info and are not stripped.
 
-`libpqxx` and `llfio` are separate Nix derivations pinned by flake inputs, so
-normal source changes and version bumps in this project do not rebuild those
-dependencies from scratch.
+`libpqxx`, `llfio`, and `reflect-cpp` are separate Nix derivations pinned by
+flake inputs, so normal source changes and version bumps in this project do not
+rebuild those dependencies from scratch. `msgpack-c` comes from nixpkgs and is
+used for MessagePack support.
 
 ### Zed and LLDB
 

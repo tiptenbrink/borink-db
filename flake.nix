@@ -23,6 +23,11 @@
       url = "git+https://github.com/ned14/llfio.git?rev=b3c9308f143e27161c40f6d52a8fd18e8f05761b&submodules=1";
       flake = false;
     };
+
+    reflect-cpp-src = {
+      url = "github:getml/reflect-cpp/c2ab61a200e69fd31424a19c6c14e28ee5ea4018";
+      flake = false;
+    };
   };
 
   outputs =
@@ -33,6 +38,7 @@
       quickcpplib-src,
       outcome-src,
       llfio-src,
+      reflect-cpp-src,
     }:
     let
       systems = [ "x86_64-linux" ];
@@ -46,11 +52,14 @@
           python3
         ];
 
-      buildInputsFor = pkgs: [ pkgs.libpq ];
-
       clangStdenvFor = pkgs: pkgs.useWildLinker pkgs.llvmPackages_latest.libcxxStdenv;
 
       clangToolsFor = pkgs: pkgs.llvmPackages_latest.clang-tools.override { enableLibcxx = true; };
+
+      buildInputsFor = pkgs: [
+        pkgs.libpq
+        pkgs.msgpack-c
+      ];
 
       mimallocFor =
         pkgs:
@@ -175,6 +184,34 @@
           ];
         };
 
+      reflectCppFor =
+        pkgs:
+        (clangStdenvFor pkgs).mkDerivation {
+          pname = "reflect-cpp";
+          version = "0.24.0";
+
+          src = reflect-cpp-src;
+
+          nativeBuildInputs = with pkgs; [
+            cmake
+            ninja
+          ];
+
+          buildInputs = [ pkgs.msgpack-c ];
+
+          cmakeFlags = [
+            "-DREFLECTCPP_INSTALL=ON"
+            "-DREFLECTCPP_BUILD_SHARED=OFF"
+            "-DREFLECTCPP_BUILD_TESTS=OFF"
+            "-DREFLECTCPP_BUILD_BENCHMARKS=OFF"
+            "-DREFLECTCPP_CHECK_HEADERS=OFF"
+            "-DREFLECTCPP_USE_VCPKG=OFF"
+            "-DREFLECTCPP_USE_BUNDLED_DEPENDENCIES=ON"
+            "-DREFLECTCPP_MSGPACK=ON"
+            "-DCMAKE_CXX_STANDARD=20"
+          ];
+        };
+
       borinkDbSourceFor =
         pkgs:
         pkgs.lib.cleanSourceWith {
@@ -210,6 +247,7 @@
               (outcomeFor pkgs)
               (libpqxxFor pkgs)
               (llfioFor pkgs)
+              (reflectCppFor pkgs)
               (mimallocFor pkgs { inherit debug; })
             ];
 
@@ -220,9 +258,11 @@
     {
       packages = forAllSystems (pkgs: {
         libpqxx = libpqxxFor pkgs;
+        msgpack-c = pkgs.msgpack-c;
         quickcpplib = quickcpplibFor pkgs;
         outcome = outcomeFor pkgs;
         llfio = llfioFor pkgs;
+        reflect-cpp = reflectCppFor pkgs;
         mimalloc-debug = mimallocFor pkgs { debug = true; };
 
         release = borinkDbFor pkgs { };
@@ -240,6 +280,7 @@
               (outcomeFor pkgs)
               (libpqxxFor pkgs)
               (llfioFor pkgs)
+              (reflectCppFor pkgs)
             ]
             ++ [
               (clangToolsFor pkgs)
@@ -252,6 +293,8 @@
           BORINK_OUTCOME_PREFIX = "${outcomeFor pkgs}";
           BORINK_LIBPQXX_PREFIX = "${libpqxxFor pkgs}";
           BORINK_LLFIO_PREFIX = "${llfioFor pkgs}";
+          BORINK_MSGPACK_C_PREFIX = "${pkgs.msgpack-c}";
+          BORINK_REFLECTCPP_PREFIX = "${reflectCppFor pkgs}";
           BORINK_MIMALLOC_RELEASE_PREFIX = "${(mimallocFor pkgs { }).dev}";
           BORINK_MIMALLOC_DEBUG_PREFIX = "${(mimallocFor pkgs { debug = true; }).dev}";
         };
