@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "libpqxx-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1775333537,
+        "narHash": "sha256-b7NgMzqu0VkAFZPmaeE0eOmsedL76MvFtWKlmD8UfAo=",
+        "owner": "jtv",
+        "repo": "libpqxx",
+        "rev": "670daea7900a9b097b9fb199c392b25bb63af48a",
+        "type": "github"
+      },
+      "original": {
+        "owner": "jtv",
+        "repo": "libpqxx",
+        "rev": "670daea7900a9b097b9fb199c392b25bb63af48a",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1776734388,
@@ -18,6 +35,7 @@
     },
     "root": {
       "inputs": {
+        "libpqxx-src": "libpqxx-src",
         "nixpkgs": "nixpkgs"
       }
     }

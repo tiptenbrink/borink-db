@@ -1,6 +1,10 @@
 build/
+build-debug/
 result
+result-debug
+result-release
 
 .claude/
 .codex
-.zed/
+.zed/*
+!.zed/debug.json

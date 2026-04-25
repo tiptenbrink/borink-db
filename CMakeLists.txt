@@ -8,8 +8,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(libpqxx CONFIG REQUIRED)
+find_package(mimalloc CONFIG REQUIRED)
 
-add_executable(borink_db src/main.cpp)
-target_link_libraries(borink_db PRIVATE libpqxx::pqxx)
+add_executable(borink_db src/main.cpp src/mimalloc.cpp)
+target_link_libraries(borink_db PRIVATE libpqxx::pqxx mimalloc)
 
 install(TARGETS borink_db RUNTIME DESTINATION bin)

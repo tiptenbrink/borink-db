@@ -7,8 +7,22 @@
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_CXX_COMPILER": "clang++",
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_PREFIX_PATH": "$env{BORINK_LIBPQXX_PREFIX};$env{BORINK_MIMALLOC_RELEASE_PREFIX}"
+      }
+    },
+    {
+      "name": "nix-clang-debug",
+      "displayName": "Nix Clang Debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_PREFIX_PATH": "$env{BORINK_LIBPQXX_PREFIX};$env{BORINK_MIMALLOC_DEBUG_PREFIX}"
       }
     }
   ],
@@ -16,6 +30,10 @@
     {
       "name": "nix-clang",
       "configurePreset": "nix-clang"
+    },
+    {
+      "name": "nix-clang-debug",
+      "configurePreset": "nix-clang-debug"
     }
   ]
 }

@@ -3,10 +3,19 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+
+    libpqxx-src = {
+      url = "github:jtv/libpqxx/670daea7900a9b097b9fb199c392b25bb63af48a";
+      flake = false;
+    };
   };
 
   outputs =
-    { nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      libpqxx-src,
+    }:
     let
       systems = [ "x86_64-linux" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f (import nixpkgs { inherit system; }));
@@ -21,26 +30,42 @@
 
       buildInputsFor = pkgs: [ pkgs.libpq ];
 
-      clangdFor =
+      clangStdenvFor = pkgs: pkgs.useWildLinker pkgs.llvmPackages_latest.libcxxStdenv;
+
+      clangToolsFor = pkgs: pkgs.llvmPackages_latest.clang-tools.override { enableLibcxx = true; };
+
+      mimallocFor =
         pkgs:
-        pkgs.writeShellScriptBin "clangd" ''
-          exec ${pkgs.llvmPackages_latest.clang-tools}/bin/clangd \
-            --query-driver=${pkgs.llvmPackages_latest.stdenv.cc}/bin/clang++ \
-            "$@"
-        '';
+        {
+          debug ? false,
+        }:
+        if debug then
+          pkgs.mimalloc.overrideAttrs (old: {
+            pname = "mimalloc-debug";
+            cmakeBuildType = "Debug";
+            dontStrip = true;
+            cmakeFlags = (old.cmakeFlags or [ ]) ++ [
+              "-DMI_DEBUG_FULL=ON"
+              "-DMI_PADDING=ON"
+              "-DMI_SHOW_ERRORS=ON"
+            ];
+          })
+        else
+          pkgs.mimalloc;
 
       libpqxxFor =
         pkgs:
-        pkgs.llvmPackages_latest.stdenv.mkDerivation {
+        (clangStdenvFor pkgs).mkDerivation {
           pname = "libpqxx";
-          version = pkgs.lib.strings.removeSuffix "\n" (builtins.readFile ./libpqxx/VERSION);
+          version = pkgs.lib.strings.removeSuffix "\n" (builtins.readFile "${libpqxx-src}/VERSION");
 
-          src = pkgs.lib.cleanSource ./libpqxx;
+          src = libpqxx-src;
 
           nativeBuildInputs = with pkgs; [
             cmake
             ninja
             pkg-config
+            python3
           ];
           buildInputs = [ pkgs.libpq ];
 
@@ -69,44 +94,63 @@
               rel = pkgs.lib.removePrefix (toString ./. + "/") (toString path);
             in
             !(
-              rel == "libpqxx"
-              || pkgs.lib.hasPrefix "libpqxx/" rel
-              || rel == "build"
+              rel == "build"
               || pkgs.lib.hasPrefix "build/" rel
               || rel == "result"
             );
         };
-    in
-    {
-      packages = forAllSystems (pkgs: {
-        libpqxx = libpqxxFor pkgs;
 
-        default = pkgs.llvmPackages_latest.stdenv.mkDerivation {
+      borinkDbFor =
+        pkgs:
+        {
+          debug ? false,
+        }:
+        (clangStdenvFor pkgs).mkDerivation {
           pname = "borink-db";
           version = "0.1.0";
 
           src = borinkDbSourceFor pkgs;
 
           nativeBuildInputs = nativeBuildInputsFor pkgs;
-          buildInputs = (buildInputsFor pkgs) ++ [ (libpqxxFor pkgs) ];
+          buildInputs =
+            (buildInputsFor pkgs)
+            ++ [
+              (libpqxxFor pkgs)
+              (mimallocFor pkgs { inherit debug; })
+            ];
 
-          cmakeBuildType = "RelWithDebInfo";
+          cmakeBuildType = if debug then "Debug" else "RelWithDebInfo";
           dontStrip = true;
         };
+    in
+    {
+      packages = forAllSystems (pkgs: {
+        libpqxx = libpqxxFor pkgs;
+        mimalloc-debug = mimallocFor pkgs { debug = true; };
+
+        release = borinkDbFor pkgs { };
+        debug = borinkDbFor pkgs { debug = true; };
+        default = borinkDbFor pkgs { };
       });
 
       devShells = forAllSystems (pkgs: {
-        default = pkgs.mkShell.override { stdenv = pkgs.llvmPackages_latest.stdenv; } {
+        default = pkgs.mkShell.override { stdenv = clangStdenvFor pkgs; } {
           packages =
             (nativeBuildInputsFor pkgs)
             ++ (buildInputsFor pkgs)
-            ++ [ (libpqxxFor pkgs) ]
             ++ [
-              (clangdFor pkgs)
-              pkgs.gdb
+              (libpqxxFor pkgs)
+            ]
+            ++ [
+              (clangToolsFor pkgs)
+              pkgs.llvmPackages_latest.lldb
               pkgs.nil
               pkgs.nixd
             ];
+
+          BORINK_LIBPQXX_PREFIX = "${libpqxxFor pkgs}";
+          BORINK_MIMALLOC_RELEASE_PREFIX = "${(mimallocFor pkgs { }).dev}";
+          BORINK_MIMALLOC_DEBUG_PREFIX = "${(mimallocFor pkgs { debug = true; }).dev}";
         };
       });
 

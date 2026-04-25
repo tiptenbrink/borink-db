@@ -1,0 +1,13 @@
+[
+  {
+    "label": "borink-db debug",
+    "adapter": "CodeLLDB",
+    "program": "$ZED_WORKTREE_ROOT/build-debug/borink_db",
+    "request": "launch",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "args": [],
+    "env": {
+      "MIMALLOC_VERBOSE": "1"
+    }
+  }
+]
