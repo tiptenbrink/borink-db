@@ -8,17 +8,14 @@
 namespace borinkdb::bytelog {
 
 struct FileLog::Impl {
-    std::unique_ptr<log::file::LogWriter> writer;
-    std::unique_ptr<log::file::LogReader> reader;
+    std::unique_ptr<log::file::LogFile> log;
 };
 
 outcome::status_result<std::unique_ptr<Log>> FileLog::open(std::string_view path) {
-    OUTCOME_TRY(auto writer, log::file::LogWriter::open(path));
-    OUTCOME_TRY(auto reader, log::file::LogReader::open(path));
+    OUTCOME_TRY(auto log, log::file::LogFile::open(path));
 
     auto impl = std::make_unique<Impl>();
-    impl->writer = std::move(writer);
-    impl->reader = std::move(reader);
+    impl->log = std::move(log);
     return std::unique_ptr<Log>(new FileLog(std::move(impl)));
 }
 
@@ -29,13 +26,12 @@ FileLog& FileLog::operator=(FileLog&&) = default;
 FileLog::~FileLog() = default;
 
 outcome::status_result<uint64_t> FileLog::put(std::string_view key, byteview meta, byteview payload) {
-    OUTCOME_TRY(auto result, impl_->writer->commit_payload(key, meta, payload));
+    OUTCOME_TRY(auto result, impl_->log->commit_payload(key, meta, payload));
 
     if (result.outcome == log::file::CommitOutcome::Lost) {
         return log::file::Error::commit_lost;
     }
 
-    OUTCOME_TRYV(impl_->reader->refresh());
     return result.ts_counter;
 }
 
@@ -50,7 +46,7 @@ outcome::status_result<std::optional<RecordView>> FileLog::get_latest(std::strin
             break;
     }
 
-    OUTCOME_TRY(auto record, impl_->reader->get_record_view(key, read_mode));
+    OUTCOME_TRY(auto record, impl_->log->get_record_view(key, read_mode));
     if (!record.has_value()) {
         return std::optional<RecordView>{};
     }
@@ -64,7 +60,7 @@ outcome::status_result<std::optional<RecordView>> FileLog::get_latest(std::strin
 }
 
 outcome::status_result<void> FileLog::refresh() {
-    return impl_->reader->refresh();
+    return impl_->log->refresh();
 }
 
 }

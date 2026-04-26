@@ -9,6 +9,7 @@
 #include <vector>
 
 #include <llfio/llfio.hpp>
+#include <outcome/experimental/status-code/include/status-code/iostream_support.hpp>
 #include <outcome/experimental/status_result.hpp>
 #include <outcome/try.hpp>
 
@@ -42,7 +43,7 @@ bool bytes_equal(std::span<const std::byte> a, std::span<const std::byte> b) {
 }
 
 outcome::status_result<std::string> make_temp_log_path() {
-        OUTCOME_TRY(auto dir, llfio::path_discovery::storage_backed_temporary_files_directory().current_path());
+    OUTCOME_TRY(auto dir, llfio::path_discovery::storage_backed_temporary_files_directory().current_path());
     std::string path = dir.string();
     if (!path.empty() && path.back() != '/') {
         path.push_back('/');
@@ -101,19 +102,22 @@ outcome::status_result<void> block_roundtrip_test() {
     const auto meta = bytes("opaque-meta");
     const auto payload = bytes("opaque-payload");
     OUTCOME_TRY(auto encoded, encode_block({
-        .kind = BlockKind::Standalone,
+        .kind = BlockKind::Group,
         .ts_counter = 7,
         .random_id = 0x1122334455667788ull,
-        .group = std::nullopt,
+        .group = GroupInfo{.index = 0, .count = 1},
         .key = "alpha",
         .meta_bytes = meta,
         .payload_bytes = payload,
     }));
 
     OUTCOME_TRY(auto decoded, decode_block(encoded));
-    if (decoded.kind != BlockKind::Standalone ||
+    if (decoded.kind != BlockKind::Group ||
         decoded.ts_counter != 7 ||
         decoded.random_id != 0x1122334455667788ull ||
+        !decoded.group ||
+        decoded.group->index != 0 ||
+        decoded.group->count != 1 ||
         decoded.total_size != encoded.size() ||
         decoded.key != "alpha" ||
         std::memcmp(decoded.meta_bytes.data(), meta.data(), meta.size()) != 0 ||
@@ -137,19 +141,18 @@ outcome::status_result<void> writer_reader_payload_test() {
     using namespace borinkdb::log::file;
 
     OUTCOME_TRY(auto path, make_temp_log_path());
-    OUTCOME_TRY(auto writer, LogWriter::open(path));
+    OUTCOME_TRY(auto log, LogFile::open(path));
 
     const auto meta = bytes("meta");
     const std::vector<std::byte> payload(2500, std::byte{0x42});
-    OUTCOME_TRY(auto commit, writer->commit_payload("large-key", meta, payload));
+    OUTCOME_TRY(auto commit, log->commit_payload("large-key", meta, payload));
     if (commit.outcome != CommitOutcome::Success) {
         OUTCOME_TRYV(unlink_path(path));
         return test_failure("commit_payload failed");
     }
 
-    OUTCOME_TRY(auto reader, LogReader::open(path));
-    OUTCOME_TRY(auto got_opt, reader->get_payload_view("large-key"));
-    if (!got_opt || !bytes_equal(*got_opt, std::span<const std::byte>{payload.data(), payload.size()})) {
+    OUTCOME_TRY(auto got_opt, log->get_record_view("large-key", LogReadMode::Cached));
+    if (!got_opt || !bytes_equal(got_opt->payload_bytes, std::span<const std::byte>{payload.data(), payload.size()})) {
         OUTCOME_TRYV(unlink_path(path));
         return test_failure("reader payload mismatch");
     }
@@ -163,22 +166,21 @@ outcome::status_result<void> wait_block_test() {
     using namespace borinkdb::log::file;
 
     OUTCOME_TRY(auto path, make_temp_log_path());
-    OUTCOME_TRY(auto writer, LogWriter::open(path));
+    OUTCOME_TRY(auto log, LogFile::open(path));
 
-    OUTCOME_TRY(auto wait, writer->commit_wait());
-    OUTCOME_TRY(auto put, writer->commit_payload("k", std::span<const std::byte>{}, byte_view("v")));
+    OUTCOME_TRY(auto wait, log->commit_wait());
+    OUTCOME_TRY(auto put, log->commit_payload("k", std::span<const std::byte>{}, byte_view("v")));
     if (wait.outcome != CommitOutcome::Success || put.outcome != CommitOutcome::Success) {
         OUTCOME_TRYV(unlink_path(path));
         return test_failure("wait/write sequence failed");
     }
 
-    OUTCOME_TRY(auto reader, LogReader::open(path));
-    if (reader->latest_counter() != 2) {
+    if (log->latest_counter() != 2) {
         OUTCOME_TRYV(unlink_path(path));
         return test_failure("reader did not count wait block");
     }
-    OUTCOME_TRY(auto got_opt, reader->get_payload_view("k"));
-    if (!got_opt || !bytes_equal(*got_opt, byte_view("v"))) {
+    OUTCOME_TRY(auto got_opt, log->get_record_view("k", LogReadMode::Cached));
+    if (!got_opt || !bytes_equal(got_opt->payload_bytes, byte_view("v"))) {
         OUTCOME_TRYV(unlink_path(path));
         return test_failure("wait block affected value index");
     }
@@ -193,18 +195,18 @@ outcome::status_result<void> corrupt_skip_test() {
     using namespace borinkdb::log::file;
 
     OUTCOME_TRY(auto path, make_temp_log_path());
-    OUTCOME_TRY(auto one, encode_block({BlockKind::Standalone, 1, 11, std::nullopt, "k", std::span<const std::byte>{}, byte_view("one")}));
-    OUTCOME_TRY(auto bad, encode_block({BlockKind::Standalone, 2, 22, std::nullopt, "k", std::span<const std::byte>{}, byte_view("bad")}));
-    OUTCOME_TRY(auto two, encode_block({BlockKind::Standalone, 3, 33, std::nullopt, "k", std::span<const std::byte>{}, byte_view("two")}));
+    OUTCOME_TRY(auto one, encode_block({BlockKind::Group, 1, 11, GroupInfo{0, 1}, "k", std::span<const std::byte>{}, byte_view("one")}));
+    OUTCOME_TRY(auto bad, encode_block({BlockKind::Group, 2, 22, GroupInfo{0, 1}, "k", std::span<const std::byte>{}, byte_view("bad")}));
+    OUTCOME_TRY(auto two, encode_block({BlockKind::Group, 3, 33, GroupInfo{0, 1}, "k", std::span<const std::byte>{}, byte_view("two")}));
     bad[12] = static_cast<std::byte>(static_cast<unsigned char>(bad[12]) ^ 0xAAu);
 
     OUTCOME_TRYV(append_raw(path, one));
     OUTCOME_TRYV(append_raw(path, bad));
     OUTCOME_TRYV(append_raw(path, two));
 
-    OUTCOME_TRY(auto reader, LogReader::open(path));
-    OUTCOME_TRY(auto got_opt, reader->get_payload_view("k"));
-    if (!got_opt || !bytes_equal(*got_opt, byte_view("two"))) {
+    OUTCOME_TRY(auto reader, LogFile::open(path));
+    OUTCOME_TRY(auto got_opt, reader->get_record_view("k", LogReadMode::Refresh));
+    if (!got_opt || !bytes_equal(got_opt->payload_bytes, byte_view("two"))) {
         OUTCOME_TRYV(unlink_path(path));
         return test_failure("reader did not skip corrupt block");
     }
@@ -283,7 +285,7 @@ outcome::status_result<void> run_tests() {
 int main() {
     auto result = run_tests();
     if (!result) {
-        std::cerr << "test failed: " << result.error().message().c_str() << '\n';
+        std::cerr << "test failed: " << result.error().message() << '\n';
         return 1;
     }
     return 0;

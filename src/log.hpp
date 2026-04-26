@@ -7,9 +7,9 @@
 #include <optional>
 #include <random>
 #include <span>
+#include <string>
 #include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 #include <array>
 #include <deque>
 #include <vector>
@@ -26,6 +26,7 @@ enum class Error
   invalid_block_kind,
   missing_group_info,
   unexpected_group_info,
+  invalid_group_info,
   key_too_large,
   metadata_too_large,
   payload_too_large,
@@ -61,6 +62,7 @@ template <> struct quick_status_code_from_enum<Error> : quick_status_code_from_e
     {Error::invalid_block_kind, "invalid block kind", {errc::invalid_argument}},
     {Error::missing_group_info, "group block missing group info", {errc::invalid_argument}},
     {Error::unexpected_group_info, "non-group block has group info", {errc::invalid_argument}},
+    {Error::invalid_group_info, "invalid group info", {errc::invalid_argument}},
     {Error::key_too_large, "key too large", {errc::message_size}},
     {Error::metadata_too_large, "metadata too large", {errc::message_size}},
     {Error::payload_too_large, "payload too large", {errc::message_size}},
@@ -92,16 +94,12 @@ inline constexpr std::array<std::byte, 4> kBlockMagic = {
     std::byte{'B'}, std::byte{'D'}, std::byte{'B'}, std::byte{'1'},
 };
 inline constexpr std::size_t kMaxBlockBytes = 1024;
-inline constexpr std::size_t kReaderChunkBytes = 8 * 1024 * 1024;
 inline constexpr std::size_t kReaderMapReservationBytes = 64ull * 1024 * 1024 * 1024;
 
 enum class BlockKind : uint8_t {
-    Standalone = 0,
-    Wait       = 1,
-    Dictionary = 2,
-    GroupFirst = 3,
-    GroupMid   = 4,
-    GroupLast  = 5,
+    Wait       = 0,
+    Dictionary = 1,
+    Group      = 2,
 };
 
 struct GroupInfo {
@@ -151,21 +149,17 @@ struct LogRecordView {
 
 enum class LogReadMode { Cached, Refresh };
 
-// File-backed byte log writer.
-class LogWriter {
+// File-backed byte log. It keeps one mmap-backed read/index view and opens the
+// append handle lazily only when a commit path first needs it.
+class LogFile {
 public:
-    static outcome::status_result<std::unique_ptr<LogWriter>> open(std::string_view path);
+    static outcome::status_result<std::unique_ptr<LogFile>> open(std::string_view path);
 
-    LogWriter(const LogWriter &) = delete;
-    LogWriter &operator=(const LogWriter &) = delete;
-    LogWriter(LogWriter &&)                 = default;
-    LogWriter &operator=(LogWriter &&)      = default;
-    ~LogWriter()                            = default;
-
-    outcome::status_result<CommitResult> commit_standalone(
-        std::string_view key,
-        byteview meta_bytes,
-        byteview payload_bytes);
+    LogFile(const LogFile &) = delete;
+    LogFile &operator=(const LogFile &) = delete;
+    LogFile(LogFile &&)                 = default;
+    LogFile &operator=(LogFile &&)      = default;
+    ~LogFile()                          = default;
 
     outcome::status_result<CommitResult> commit_wait();
 
@@ -174,46 +168,8 @@ public:
         byteview meta_bytes,
         byteview payload_bytes);
 
-    [[nodiscard]] uint64_t latest_counter()  const noexcept { return latest_ts_; }
-    [[nodiscard]] uint64_t scanned_through() const noexcept { return scanned_through_offset_; }
-
-private:
-    LogWriter(llfio::file_handle append_h, llfio::file_handle read_h, std::mt19937_64 rng);
-
-    using BlockVisitor = std::function<void(uint64_t file_offset, const DecodedBlock &)>;
-
-    // review: explain the contract of this function
-    outcome::status_result<uint64_t>      scan_range(uint64_t start, uint64_t end,
-                                                                     const BlockVisitor &visit);
-    outcome::status_result<void>           refresh_tail();
-    outcome::status_result<CommitOutcome>  resolve_outcome(uint64_t our_ts, uint64_t our_id,
-                                                                          std::optional<uint16_t> group_count);
-    outcome::status_result<CommitResult>   commit_blocks(std::vector<std::vector<std::byte>> blocks,
-                                                                        uint64_t our_ts, uint64_t our_id,
-                                                                        std::optional<uint16_t> group_count);
-
-    llfio::file_handle append_h_;
-    llfio::file_handle read_h_;
-    std::mt19937_64    rng_;
-    uint64_t           scanned_through_offset_ = 0;
-    uint64_t           latest_ts_              = 0;
-};
-
-class LogReader {
-public:
-    static outcome::status_result<std::unique_ptr<LogReader>> open(std::string_view path);
-
-    LogReader(const LogReader &) = delete;
-    LogReader &operator=(const LogReader &) = delete;
-    LogReader(LogReader &&)                 = default;
-    LogReader &operator=(LogReader &&)      = default;
-    ~LogReader()                            = default;
-
-    // Returns a borrowed payload view — invalidated by the next call that may
+    // Returns a borrowed log record view — invalidated by the next call that may
     // refresh the mapping or reuse grouped scratch storage.
-    outcome::status_result<std::optional<byteview>>
-        get_payload_view(std::string_view key);
-
     outcome::status_result<std::optional<LogRecordView>>
         get_record_view(std::string_view key, LogReadMode mode);
 
@@ -223,9 +179,33 @@ public:
     [[nodiscard]] uint64_t scanned_through() const noexcept { return scanned_through_offset_; }
 
 private:
-    explicit LogReader(llfio::mapped_file_handle mapped_h);
+    LogFile(std::string path, llfio::mapped_file_handle mapped_h, std::mt19937_64 rng);
+
+    using BlockVisitor = std::function<void(uint64_t file_offset, const DecodedBlock &)>;
+    using CorruptRangeVisitor = std::function<void()>;
+
+    // Scans [start, end) for complete valid blocks, skipping corrupt bytes until
+    // the next block magic. Returns the file offset fully consumed; a trailing
+    // partial block is left unconsumed for a later refresh.
+    outcome::status_result<uint64_t>      scan_range(byteview mapped, uint64_t start, uint64_t end,
+                                                                     const BlockVisitor &visit,
+                                                                     const CorruptRangeVisitor& on_corrupt = {});
+    outcome::status_result<void>           ensure_append_handle();
+    outcome::status_result<CommitOutcome>  resolve_outcome(uint64_t our_ts, uint64_t our_id,
+                                                                          std::optional<uint16_t> group_count);
+    outcome::status_result<void>           write_block(byteview bytes);
 
     struct IndexedValue { uint64_t ts_counter; uint64_t file_offset; };
+    struct PendingGroup {
+        bool active = false;
+        uint64_t ts = 0;
+        uint64_t id = 0;
+        uint64_t first_offset = 0;
+        uint64_t expected_offset = 0;
+        uint16_t next_index = 0;
+        uint16_t count = 0;
+        std::string key;
+    };
 
     struct KeyHash {
         using is_transparent = void;
@@ -246,18 +226,20 @@ private:
     };
 
     outcome::status_result<void>                    refresh_index();
+    void index_block(uint64_t file_offset, const DecodedBlock& blk, PendingGroup& group);
     outcome::status_result<LogRecordView>           record_view_at(uint64_t file_offset);
-    outcome::status_result<byteview> payload_view_at(uint64_t file_offset);
     outcome::status_result<byteview> mapped_bytes();
     void maybe_index_value(uint64_t file_offset, uint64_t ts_counter,
-                           std::string_view key, byteview payload_bytes);
+                           std::string_view key);
 
+    std::string path_;
+    std::optional<llfio::file_handle> append_h_;
     llfio::mapped_file_handle mapped_h_;
+    std::mt19937_64    rng_;
     uint64_t  scanned_through_offset_ = 0;
     uint64_t  latest_ts_              = 0;
     KeyArena  key_arena_;
     std::unordered_map<std::string_view, IndexedValue, KeyHash, KeyEqual> latest_by_key_;
-    std::unordered_set<uint64_t> committed_counters_;
     std::vector<std::byte>       grouped_payload_scratch_;
 };
 
