@@ -7,6 +7,7 @@
 #include <outcome/experimental/status_result.hpp>
 #include <span>
 #include <string_view>
+#include <vector>
 
 namespace borinkdb {
 
@@ -30,7 +31,7 @@ enum class ReadOptions {
 struct RecordView {
     uint64_t counter = 0;
     byteview meta;
-    byteview payload;
+    std::vector<byteview> payload_blocks;
 };
 
 
@@ -44,8 +45,8 @@ public:
 
     // Refresh the backend's view of storage as needed and return the latest
     // committed value for key. Returned spans are borrowed from the backend and
-    // stay valid only until the next backend operation that can refresh or reuse
-    // its internal buffers.
+    // stay valid while the Log is alive. Payload is exposed as block spans;
+    // callers can copy if they need one contiguous buffer.
     virtual outcome::status_result<std::optional<RecordView>>
         get_latest(std::string_view key, ReadOptions options = ReadOptions::Refresh) = 0;
 

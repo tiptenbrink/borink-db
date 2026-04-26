@@ -51,11 +51,11 @@ outcome::status_result<std::optional<RecordView>> FileLog::get_latest(std::strin
         return std::optional<RecordView>{};
     }
 
-    const log::file::LogRecordView& value = *record;
+    const auto& value = *record;
     return std::optional<RecordView>{RecordView{
-        .counter = value.counter,
-        .meta = value.meta_bytes,
-        .payload = value.payload_bytes,
+        .counter = value.counter(),
+        .meta = value.meta_bytes(),
+        .payload_blocks = {value.payload_blocks().begin(), value.payload_blocks().end()},
     }};
 }
 

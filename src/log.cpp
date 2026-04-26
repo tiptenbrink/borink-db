@@ -141,6 +141,44 @@ outcome::status_result<byteview> mapped_bytes(llfio::mapped_file_handle& mapped_
     return byteview{p, static_cast<std::size_t>(extent)};
 }
 
+LogRecordView::LogRecordView(uint64_t counter,
+                             byteview meta_bytes,
+                             PayloadBlockList payload_blocks)
+    : counter_(counter),
+      meta_bytes_(meta_bytes),
+      payload_blocks_(std::move(payload_blocks)) {}
+
+void PayloadBlockList::reserve(std::size_t capacity) {
+    if (capacity <= kInlineCapacity || !heap_.empty()) {
+        if (!heap_.empty()) {
+            heap_.reserve(capacity);
+        }
+        return;
+    }
+
+    heap_.reserve(capacity);
+    heap_.insert(heap_.end(), inline_.begin(), inline_.begin() + static_cast<std::ptrdiff_t>(size_));
+}
+
+void PayloadBlockList::push_back(byteview block) {
+    if (heap_.empty() && size_ < kInlineCapacity) {
+        inline_[size_] = block;
+    } else {
+        if (heap_.empty()) {
+            reserve(kInlineCapacity + 1);
+        }
+        heap_.push_back(block);
+    }
+    ++size_;
+}
+
+std::span<const byteview> PayloadBlockList::view() const noexcept {
+    if (!heap_.empty()) {
+        return {heap_.data(), heap_.size()};
+    }
+    return {inline_.data(), size_};
+}
+
 outcome::status_result<std::vector<std::byte>> encode_block(const EncodeRequest& req) {
     if (!kind_is_known(static_cast<uint8_t>(req.kind))) {
         return Error::invalid_block_kind;
@@ -619,6 +657,18 @@ outcome::status_result<byteview> LogFile::mapped_bytes() {
     return borinkdb::log::file::mapped_bytes(mapped_h_);
 }
 
+outcome::status_result<byteview> LogFile::current_mapped_bytes() const {
+    const auto extent = mapped_h_.map().length();
+    if (extent == 0) {
+        return byteview{};
+    }
+    const auto* p = reinterpret_cast<const std::byte*>(mapped_h_.address());
+    if (p == nullptr) {
+        return Error::mapped_file_unavailable;
+    }
+    return byteview{p, static_cast<std::size_t>(extent)};
+}
+
 void LogFile::index_block(uint64_t file_offset, const DecodedBlock& blk, PendingGroup& group) {
     latest_ts_ = std::max(latest_ts_, blk.ts_counter);
 
@@ -687,7 +737,7 @@ outcome::status_result<void> LogFile::refresh() {
 }
 
 outcome::status_result<LogRecordView> LogFile::record_view_at(uint64_t file_offset) {
-    OUTCOME_TRY(auto mapped, mapped_bytes());
+    OUTCOME_TRY(auto mapped, current_mapped_bytes());
     if (file_offset >= mapped.size()) {
         return Error::invalid_file_offset;
     }
@@ -698,20 +748,9 @@ outcome::status_result<LogRecordView> LogFile::record_view_at(uint64_t file_offs
         return Error::corrupt_group;
     }
 
-    if (first_block.group->count == 1) {
-        return LogRecordView{
-            .counter = first_block.ts_counter,
-            .meta_bytes = first_block.meta_bytes,
-            .payload_bytes = first_block.payload_bytes,
-        };
-    }
-
-    grouped_payload_scratch_.clear();
-    grouped_payload_scratch_.reserve(static_cast<std::size_t>(first_block.group->count) * 800);
-    grouped_payload_scratch_.insert(
-        grouped_payload_scratch_.end(),
-        first_block.payload_bytes.begin(),
-        first_block.payload_bytes.end());
+    PayloadBlockList payload_blocks;
+    payload_blocks.reserve(first_block.group->count);
+    payload_blocks.push_back(first_block.payload_bytes);
 
     uint64_t next_offset = file_offset + first_block.total_size;
     for (uint16_t next_index = 1; next_index < first_block.group->count; ++next_index) {
@@ -727,17 +766,10 @@ outcome::status_result<LogRecordView> LogFile::record_view_at(uint64_t file_offs
             block.random_id != first_block.random_id) {
             return Error::corrupt_group;
         }
-        grouped_payload_scratch_.insert(
-            grouped_payload_scratch_.end(),
-            block.payload_bytes.begin(),
-            block.payload_bytes.end());
+        payload_blocks.push_back(block.payload_bytes);
         next_offset += block.total_size;
     }
-    return LogRecordView{
-        .counter = first_block.ts_counter,
-        .meta_bytes = first_block.meta_bytes,
-        .payload_bytes = {grouped_payload_scratch_.data(), grouped_payload_scratch_.size()},
-    };
+    return LogRecordView(first_block.ts_counter, first_block.meta_bytes, std::move(payload_blocks));
 }
 
 outcome::status_result<std::optional<LogRecordView>> LogFile::get_record_view(std::string_view key, LogReadMode mode) {

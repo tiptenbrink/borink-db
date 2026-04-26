@@ -145,10 +145,47 @@ struct CommitResult {
     uint64_t      random_id;
 };
 
-struct LogRecordView {
-    uint64_t                   counter;
-    byteview meta_bytes;
-    byteview payload_bytes;
+// Most records fit in one block, and even split records usually need only a
+// handful of block views. Keep those views inline so reading a record does not
+// allocate just to describe the payload layout; spill only for unusually large
+// payloads.
+class PayloadBlockList {
+public:
+    void reserve(std::size_t capacity);
+    void push_back(byteview block);
+
+    [[nodiscard]] std::span<const byteview> view() const noexcept;
+
+private:
+    static constexpr std::size_t kInlineCapacity = 4;
+
+    std::array<byteview, kInlineCapacity> inline_{};
+    std::vector<byteview> heap_;
+    std::size_t size_ = 0;
+};
+
+class LogRecordView {
+public:
+    LogRecordView(LogRecordView&&) noexcept = default;
+    LogRecordView& operator=(LogRecordView&&) noexcept = default;
+    LogRecordView(const LogRecordView&) = delete;
+    LogRecordView& operator=(const LogRecordView&) = delete;
+    ~LogRecordView() = default;
+
+    [[nodiscard]] uint64_t counter() const noexcept { return counter_; }
+    [[nodiscard]] byteview meta_bytes() const noexcept { return meta_bytes_; }
+    [[nodiscard]] std::span<const byteview> payload_blocks() const noexcept {
+        return payload_blocks_.view();
+    }
+
+private:
+    friend class LogFile;
+
+    LogRecordView(uint64_t counter, byteview meta_bytes, PayloadBlockList payload_blocks);
+
+    uint64_t counter_ = 0;
+    byteview meta_bytes_;
+    PayloadBlockList payload_blocks_;
 };
 
 enum class LogReadMode { Cached, Refresh };
@@ -213,7 +250,8 @@ public:
         byteview meta_bytes,
         byteview payload_bytes);
 
-    // Returns a borrowed log record view.
+    // Returns a borrowed log record view. Keep LogFile alive longer than any
+    // view returned from it.
     //
     // Mmap-backed spans are assumed stable across ordinary append-only growth:
     // LLFIO's update_map() should not invalidate previous block addresses while
@@ -224,8 +262,8 @@ public:
     // Windows read-only mapping growth needs dedicated testing before we treat
     // this as more than an implementation assumption there.
     //
-    // Multi-block payload spans are backed by grouped_payload_scratch_ and are
-    // invalidated by the next multi-block read on this LogFile.
+    // Payload is exposed as block spans instead of one contiguous buffer. Callers
+    // that need contiguous bytes can copy while holding the returned view.
     outcome::status_result<std::optional<LogRecordView>>
         get_record_view(std::string_view key, LogReadMode mode);
 
@@ -286,6 +324,7 @@ private:
     void index_block(uint64_t file_offset, const DecodedBlock& blk, PendingGroup& group);
     outcome::status_result<LogRecordView>           record_view_at(uint64_t file_offset);
     outcome::status_result<byteview> mapped_bytes();
+    outcome::status_result<byteview> current_mapped_bytes() const;
     void maybe_index_value(uint64_t file_offset, uint64_t ts_counter,
                            std::string_view key);
 
@@ -298,7 +337,6 @@ private:
     uint64_t  latest_ts_              = 0;
     KeyArena  key_arena_;
     std::unordered_map<std::string_view, IndexedValue, KeyHash, KeyEqual> latest_by_key_;
-    std::vector<std::byte>       grouped_payload_scratch_;
     std::unique_ptr<FileWatcher> watcher_;
 };
 
