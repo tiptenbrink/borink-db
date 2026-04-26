@@ -179,6 +179,7 @@
             "-DLLFIO_ENABLE_DEPENDENCY_SMOKE_TEST=OFF"
             "-DLLFIO_FORCE_COROUTINES_OFF=ON"
             "-DCXX_COROUTINES_FLAGS="
+            "-DLLFIO_USE_EXPERIMENTAL_SG14_STATUS_CODE=ON"
             "-DBUILD_TESTING=OFF"
             "-DCMAKE_CXX_STANDARD=20"
           ];
@@ -221,11 +222,7 @@
             let
               rel = pkgs.lib.removePrefix (toString ./. + "/") (toString path);
             in
-            !(
-              rel == "build"
-              || pkgs.lib.hasPrefix "build/" rel
-              || rel == "result"
-            );
+            !(rel == "build" || pkgs.lib.hasPrefix "build/" rel || rel == "result");
         };
 
       borinkDbFor =
@@ -240,16 +237,14 @@
           src = borinkDbSourceFor pkgs;
 
           nativeBuildInputs = nativeBuildInputsFor pkgs;
-          buildInputs =
-            (buildInputsFor pkgs)
-            ++ [
-              (quickcpplibFor pkgs)
-              (outcomeFor pkgs)
-              (libpqxxFor pkgs)
-              (llfioFor pkgs)
-              (reflectCppFor pkgs)
-              (mimallocFor pkgs { inherit debug; })
-            ];
+          buildInputs = (buildInputsFor pkgs) ++ [
+            (quickcpplibFor pkgs)
+            (outcomeFor pkgs)
+            (libpqxxFor pkgs)
+            (llfioFor pkgs)
+            (reflectCppFor pkgs)
+            (mimallocFor pkgs { inherit debug; })
+          ];
 
           cmakeBuildType = if debug then "Debug" else "RelWithDebInfo";
           dontStrip = true;
@@ -268,6 +263,15 @@
         release = borinkDbFor pkgs { };
         debug = borinkDbFor pkgs { debug = true; };
         default = borinkDbFor pkgs { };
+      });
+
+      checks = forAllSystems (pkgs: {
+        release-build = borinkDbFor pkgs { };
+        debug-build = borinkDbFor pkgs { debug = true; };
+        debug-tests = pkgs.runCommand "borink-db-debug-tests" { } ''
+          ${borinkDbFor pkgs { debug = true; }}/bin/borink_db
+          touch "$out"
+        '';
       });
 
       devShells = forAllSystems (pkgs: {

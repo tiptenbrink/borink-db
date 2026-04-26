@@ -14,7 +14,15 @@ find_package(mimalloc CONFIG REQUIRED)
 find_package(msgpack-c CONFIG REQUIRED)
 find_package(reflectcpp CONFIG REQUIRED)
 
-add_executable(borink_db src/main.cpp src/mimalloc.cpp)
-target_link_libraries(borink_db PRIVATE libpqxx::pqxx llfio::sl mimalloc reflectcpp::reflectcpp)
+add_executable(borink_db
+    src/main.cpp
+    src/mimalloc.cpp
+    src/byte_io.cpp
+    src/crc32c.cpp
+    src/log.cpp
+    src/log_api.cpp
+)
+target_link_libraries(borink_db PRIVATE llfio::sl mimalloc)
+target_compile_definitions(borink_db PRIVATE LLFIO_UNSTABLE_VERSION=1)
 
 install(TARGETS borink_db RUNTIME DESTINATION bin)

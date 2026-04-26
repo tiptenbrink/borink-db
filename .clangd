@@ -1,4 +1,4 @@
 CompileFlags:
-  CompilationDatabase: build
+  CompilationDatabase: build-debug
   Add:
     - -std=c++20
