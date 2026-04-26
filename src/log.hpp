@@ -1,16 +1,20 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <array>
+#include <atomic>
 #include <deque>
 #include <vector>
 
@@ -149,6 +153,47 @@ struct LogRecordView {
 
 enum class LogReadMode { Cached, Refresh };
 
+class FileWatcher {
+public:
+    using Callback = std::function<void()>;
+
+    static outcome::status_result<std::unique_ptr<FileWatcher>>
+        start(std::string path, std::chrono::milliseconds poll_interval, Callback callback);
+
+    FileWatcher(const FileWatcher&) = delete;
+    FileWatcher& operator=(const FileWatcher&) = delete;
+    FileWatcher(FileWatcher&&) = delete;
+    FileWatcher& operator=(FileWatcher&&) = delete;
+    ~FileWatcher();
+
+private:
+    struct Snapshot {
+        uint64_t size = 0;
+        std::chrono::system_clock::time_point modified;
+
+        bool operator!=(const Snapshot& other) const noexcept {
+            return size != other.size || modified != other.modified;
+        }
+    };
+
+    FileWatcher(std::string path,
+                llfio::file_handle handle,
+                Snapshot initial,
+                std::chrono::milliseconds poll_interval,
+                Callback callback);
+
+    static outcome::status_result<Snapshot> snapshot(llfio::file_handle& handle);
+    void run();
+
+    std::string path_;
+    llfio::file_handle handle_;
+    Snapshot last_;
+    std::chrono::milliseconds poll_interval_;
+    Callback callback_;
+    std::atomic<bool> stop_{false};
+    std::thread thread_;
+};
+
 // File-backed byte log. It keeps one mmap-backed read/index view and opens the
 // append handle lazily only when a commit path first needs it.
 class LogFile {
@@ -157,9 +202,9 @@ public:
 
     LogFile(const LogFile &) = delete;
     LogFile &operator=(const LogFile &) = delete;
-    LogFile(LogFile &&)                 = default;
-    LogFile &operator=(LogFile &&)      = default;
-    ~LogFile()                          = default;
+    LogFile(LogFile&&) = delete;
+    LogFile& operator=(LogFile&&) = delete;
+    ~LogFile();
 
     outcome::status_result<CommitResult> commit_wait();
 
@@ -168,15 +213,26 @@ public:
         byteview meta_bytes,
         byteview payload_bytes);
 
-    // Returns a borrowed log record view — invalidated by the next call that may
-    // refresh the mapping or reuse grouped scratch storage.
+    // Returns a borrowed log record view.
+    //
+    // Mmap-backed spans are assumed stable across ordinary append-only growth:
+    // LLFIO's update_map() should not invalidate previous block addresses while
+    // the existing map/section remains valid, the file is not truncated or
+    // relinked, and the file stays within kReaderMapReservationBytes. A map or
+    // section can become invalid if the file is zero-length when mapped, is later
+    // truncated to zero, is relinked/replaced, or LLFIO must recreate the mapping.
+    // Windows read-only mapping growth needs dedicated testing before we treat
+    // this as more than an implementation assumption there.
+    //
+    // Multi-block payload spans are backed by grouped_payload_scratch_ and are
+    // invalidated by the next multi-block read on this LogFile.
     outcome::status_result<std::optional<LogRecordView>>
         get_record_view(std::string_view key, LogReadMode mode);
 
     outcome::status_result<void> refresh();
 
-    [[nodiscard]] uint64_t latest_counter()  const noexcept { return latest_ts_; }
-    [[nodiscard]] uint64_t scanned_through() const noexcept { return scanned_through_offset_; }
+    [[nodiscard]] uint64_t latest_counter() const;
+    [[nodiscard]] uint64_t scanned_through() const;
 
 private:
     LogFile(std::string path, llfio::mapped_file_handle mapped_h, std::mt19937_64 rng);
@@ -194,6 +250,7 @@ private:
     outcome::status_result<CommitOutcome>  resolve_outcome(uint64_t our_ts, uint64_t our_id,
                                                                           std::optional<uint16_t> group_count);
     outcome::status_result<void>           write_block(byteview bytes);
+    void refresh_from_watcher() noexcept;
 
     struct IndexedValue { uint64_t ts_counter; uint64_t file_offset; };
     struct PendingGroup {
@@ -235,12 +292,14 @@ private:
     std::string path_;
     std::optional<llfio::file_handle> append_h_;
     llfio::mapped_file_handle mapped_h_;
+    mutable std::mutex mutex_;
     std::mt19937_64    rng_;
     uint64_t  scanned_through_offset_ = 0;
     uint64_t  latest_ts_              = 0;
     KeyArena  key_arena_;
     std::unordered_map<std::string_view, IndexedValue, KeyHash, KeyEqual> latest_by_key_;
     std::vector<std::byte>       grouped_payload_scratch_;
+    std::unique_ptr<FileWatcher> watcher_;
 };
 
 } // namespace borinkdb

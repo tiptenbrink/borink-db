@@ -55,9 +55,9 @@ void write_bytes(std::byte*& dst, std::string_view bytes) noexcept {
 }
 
 uint16_t read_u16_le(const std::byte*& src) noexcept {
-    const uint16_t v =
-        static_cast<uint16_t>(static_cast<uint8_t>(src[0])) |
-        (static_cast<uint16_t>(static_cast<uint8_t>(src[1])) << 8);
+    const auto lo = static_cast<uint16_t>(static_cast<uint8_t>(src[0]));
+    const auto hi = static_cast<uint16_t>(static_cast<uint16_t>(static_cast<uint8_t>(src[1])) << 8);
+    const auto v = static_cast<uint16_t>(lo | hi);
     src += 2;
     return v;
 }

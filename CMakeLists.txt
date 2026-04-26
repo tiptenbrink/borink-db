@@ -22,7 +22,11 @@ add_executable(borink_db
     src/log.cpp
     src/log_api.cpp
 )
-target_link_libraries(borink_db PRIVATE llfio::sl mimalloc)
+target_link_libraries(borink_db PRIVATE llfio::sl mimalloc Threads::Threads)
+target_compile_options(borink_db PRIVATE
+    $<$<CXX_COMPILER_ID:Clang>:-Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Wshadow -Wnon-virtual-dtor -Wold-style-cast -Woverloaded-virtual -Wnull-dereference -Wdouble-promotion -Wformat=2 -Wimplicit-fallthrough -Werror>
+    $<$<CXX_COMPILER_ID:GNU>:-Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Wshadow -Wnon-virtual-dtor -Wold-style-cast -Woverloaded-virtual -Wnull-dereference -Wdouble-promotion -Wformat=2 -Wimplicit-fallthrough -Werror>
+)
 target_compile_definitions(borink_db PRIVATE LLFIO_UNSTABLE_VERSION=1)
 
 install(TARGETS borink_db RUNTIME DESTINATION bin)

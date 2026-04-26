@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstring>
 #include <outcome/try.hpp>
+#include <thread>
 
 namespace borinkdb::log::file {
 
@@ -297,6 +298,67 @@ outcome::status_result<DecodedBlock> decode_block(byteview input) noexcept {
     };
 }
 
+outcome::status_result<std::unique_ptr<FileWatcher>>
+FileWatcher::start(std::string path, std::chrono::milliseconds poll_interval, Callback callback) {
+    const llfio::path_view path_view{path.data(), path.size(), llfio::path_view::not_zero_terminated};
+    OUTCOME_TRY(auto handle, llfio::file_handle::file(
+        {},
+        path_view,
+        llfio::file_handle::mode::read,
+        llfio::file_handle::creation::open_existing,
+        llfio::file_handle::caching::reads));
+    OUTCOME_TRY(auto initial, snapshot(handle));
+    return std::unique_ptr<FileWatcher>(
+        new FileWatcher(std::move(path), std::move(handle), initial, poll_interval, std::move(callback)));
+}
+
+FileWatcher::FileWatcher(std::string path,
+                         llfio::file_handle handle,
+                         Snapshot initial,
+                         std::chrono::milliseconds poll_interval,
+                         Callback callback)
+    : path_(std::move(path)),
+      handle_(std::move(handle)),
+      last_(initial),
+      poll_interval_(poll_interval),
+      callback_(std::move(callback)),
+      thread_([this] { run(); }) {}
+
+FileWatcher::~FileWatcher() {
+    stop_.store(true, std::memory_order_release);
+    if (thread_.joinable()) {
+        thread_.join();
+    }
+}
+
+outcome::status_result<FileWatcher::Snapshot> FileWatcher::snapshot(llfio::file_handle& handle) {
+    llfio::stat_t stat(nullptr);
+    OUTCOME_TRY(auto filled, stat.fill(handle, llfio::stat_t::want::size | llfio::stat_t::want::mtim));
+    (void) filled;
+    return Snapshot{
+        .size = stat.st_size,
+        .modified = stat.st_mtim,
+    };
+}
+
+void FileWatcher::run() {
+    while (!stop_.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(poll_interval_);
+        if (stop_.load(std::memory_order_acquire)) {
+            break;
+        }
+
+        auto current = snapshot(handle_);
+        if (!current) {
+            continue;
+        }
+        if (current.value() != last_) {
+            last_ = current.value();
+            callback_();
+        }
+    }
+}
+
 outcome::status_result<std::unique_ptr<LogFile>> LogFile::open(std::string_view path) {
     const llfio::path_view path_view{path.data(), path.size(), llfio::path_view::not_zero_terminated};
     OUTCOME_TRY(auto mapped_h, llfio::mapped_file_handle::mapped_file(
@@ -314,11 +376,17 @@ outcome::status_result<std::unique_ptr<LogFile>> LogFile::open(std::string_view 
     std::seed_seq seed{rd(), rd(), rd(), rd(),
                        static_cast<unsigned>(std::chrono::steady_clock::now().time_since_epoch().count())};
     auto log = std::unique_ptr<LogFile>(new LogFile(std::string{path}, std::move(mapped_h), std::mt19937_64(seed)));
+    OUTCOME_TRY(auto watcher, FileWatcher::start(log->path_, std::chrono::milliseconds{50}, [log_ptr = log.get()] {
+        log_ptr->refresh_from_watcher();
+    }));
+    log->watcher_ = std::move(watcher);
     return log;
 }
 
 LogFile::LogFile(std::string path, llfio::mapped_file_handle mapped_h, std::mt19937_64 rng)
     : path_(std::move(path)), mapped_h_(std::move(mapped_h)), rng_(std::move(rng)) {}
+
+LogFile::~LogFile() = default;
 
 outcome::status_result<uint64_t> LogFile::scan_range(byteview mapped,
                                                uint64_t start_offset,
@@ -420,6 +488,7 @@ outcome::status_result<void> LogFile::write_block(byteview bytes) {
 }
 
 outcome::status_result<CommitResult> LogFile::commit_wait() {
+    std::lock_guard lock(mutex_);
     OUTCOME_TRYV(refresh_index());
     const uint64_t our_ts = latest_ts_ + 1;
     const uint64_t our_id = rng_();
@@ -443,6 +512,7 @@ outcome::status_result<CommitResult> LogFile::commit_payload(
     std::string_view key,
     byteview meta_bytes,
     byteview payload_bytes) {
+    std::lock_guard lock(mutex_);
     OUTCOME_TRYV(refresh_index());
     const uint64_t our_ts = latest_ts_ + 1;
     const uint64_t our_id = rng_();
@@ -612,6 +682,7 @@ outcome::status_result<void> LogFile::refresh_index() {
 }
 
 outcome::status_result<void> LogFile::refresh() {
+    std::lock_guard lock(mutex_);
     return refresh_index();
 }
 
@@ -670,6 +741,7 @@ outcome::status_result<LogRecordView> LogFile::record_view_at(uint64_t file_offs
 }
 
 outcome::status_result<std::optional<LogRecordView>> LogFile::get_record_view(std::string_view key, LogReadMode mode) {
+    std::lock_guard lock(mutex_);
     if (mode == LogReadMode::Refresh) {
         OUTCOME_TRYV(refresh_index());
     }
@@ -679,6 +751,24 @@ outcome::status_result<std::optional<LogRecordView>> LogFile::get_record_view(st
     }
     OUTCOME_TRY(auto record, record_view_at(it->second.file_offset));
     return std::optional<LogRecordView>{std::move(record)};
+}
+
+uint64_t LogFile::latest_counter() const {
+    std::lock_guard lock(mutex_);
+    return latest_ts_;
+}
+
+uint64_t LogFile::scanned_through() const {
+    std::lock_guard lock(mutex_);
+    return scanned_through_offset_;
+}
+
+void LogFile::refresh_from_watcher() noexcept {
+    std::unique_lock lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return;
+    }
+    (void) refresh_index();
 }
 
 }

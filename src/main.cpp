@@ -6,6 +6,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <llfio/llfio.hpp>
@@ -240,16 +241,20 @@ outcome::status_result<void> file_byte_log_cache_test() {
     OUTCOME_TRY(auto other, FileLog::open(path));
     OUTCOME_TRY(auto second_counter, other->put("k", byte_view("m2"), byte_view("two")));
 
-    OUTCOME_TRY(auto still_cached_opt, opened->get_latest("k", ReadOptions::UseCached));
-    if (!still_cached_opt) {
-        OUTCOME_TRYV(unlink_path(path));
-        return test_failure("file byte log cached read refreshed unexpectedly");
+    std::optional<RecordView> watched_cached;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        OUTCOME_TRY(auto cached_after_external, opened->get_latest("k", ReadOptions::UseCached));
+        if (cached_after_external && cached_after_external->counter == second_counter) {
+            watched_cached = cached_after_external;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{25});
     }
-    const auto& still_cached = *still_cached_opt;
-    if (still_cached.counter != first_counter ||
-        !bytes_equal(still_cached.payload, byte_view("one"))) {
+    if (!watched_cached ||
+        !bytes_equal(watched_cached->meta, byte_view("m2")) ||
+        !bytes_equal(watched_cached->payload, byte_view("two"))) {
         OUTCOME_TRYV(unlink_path(path));
-        return test_failure("file byte log cached read refreshed unexpectedly");
+        return test_failure("file byte log watcher did not refresh cached read");
     }
 
     OUTCOME_TRY(auto fresh_opt, opened->get_latest("k", ReadOptions::Refresh));
