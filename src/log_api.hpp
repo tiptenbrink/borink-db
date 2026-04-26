@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <outcome/experimental/status_result.hpp>
 #include <span>
 #include <string_view>
 
@@ -17,40 +19,20 @@ namespace borinkdb {
 
 namespace bytelog {
 
-enum class Status {
-    Ok,
-    NotFound,
-    Lost,
-    ReadFailed,
-    WriteFailed,
-    TooLarge,
-    CorruptStorage,
-};
+namespace outcome = OUTCOME_V2_NAMESPACE::experimental;
+using byteview = std::span<const std::byte>;
 
 enum class ReadOptions {
     Refresh,
     UseCached,
 };
 
-struct Put {
-    Status status = Status::Ok;
+struct RecordView {
     uint64_t counter = 0;
-
-    explicit operator bool() { return status == Status::Ok; }
-
-    // TODO: some convenient way to check if we have to retry, some errors are fatal others aren't
+    byteview meta;
+    byteview payload;
 };
 
-struct RecordViewGet {
-    Status status = Status::NotFound;
-    uint64_t counter = 0;
-    std::span<const std::byte> meta;
-    std::span<const std::byte> payload;
-
-    explicit operator bool() { return status == Status::Ok; }
-};
-
-using byteview = std::span<const std::byte>;
 
 class Log {
 public:
@@ -58,30 +40,24 @@ public:
 
     // Append one logical value. A Committed result means fresh reads should return this
     // value until a higher counter for the same key is committed.
-    virtual Put put(std::string_view key, byteview meta, byteview payload) = 0;
+    virtual outcome::status_result<uint64_t> put(std::string_view key, byteview meta, byteview payload) = 0;
 
     // Refresh the backend's view of storage as needed and return the latest
     // committed value for key. Returned spans are borrowed from the backend and
     // stay valid only until the next backend operation that can refresh or reuse
     // its internal buffers.
-    virtual RecordViewGet get_latest(std::string_view key, ReadOptions options = ReadOptions::Refresh) = 0;
+    virtual outcome::status_result<std::optional<RecordView>>
+        get_latest(std::string_view key, ReadOptions options = ReadOptions::Refresh) = 0;
 
     // Bring this instance's read-side cache/index forward without requiring a
     // lookup. For PostgreSQL this can be driven by LISTEN/NOTIFY; for the file
     // backend it scans the appended tail into the mmap-backed reader index.
-    virtual Status refresh() = 0;
-};
-
-struct FileLogOpen {
-    Status status = Status::Ok;
-    std::unique_ptr<Log> log;
-
-    explicit operator bool() { return status == Status::Ok && log != nullptr; }
+    virtual outcome::status_result<void> refresh() = 0;
 };
 
 class FileLog final : public Log {
 public:
-    static FileLogOpen open(std::string_view path);
+    static outcome::status_result<std::unique_ptr<Log>> open(std::string_view path);
 
     FileLog(FileLog&&);
     FileLog& operator=(FileLog&&);
@@ -90,9 +66,10 @@ public:
     FileLog(const FileLog&) = delete;
     FileLog& operator=(const FileLog&) = delete;
 
-    Put put(std::string_view key, byteview meta, byteview payload) override;
-    RecordViewGet get_latest(std::string_view key, ReadOptions options = ReadOptions::Refresh) override;
-    Status refresh() override;
+    outcome::status_result<uint64_t> put(std::string_view key, byteview meta, byteview payload) override;
+    outcome::status_result<std::optional<RecordView>>
+        get_latest(std::string_view key, ReadOptions options = ReadOptions::Refresh) override;
+    outcome::status_result<void> refresh() override;
 
 private:
     struct Impl;

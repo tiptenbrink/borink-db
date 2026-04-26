@@ -3,10 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <llfio/v2.0/config.hpp>
 #include <memory>
 #include <optional>
-#include <outcome/config.hpp>
 #include <random>
 #include <span>
 #include <string_view>
@@ -41,7 +39,8 @@ enum class Error
   short_write,
   mapped_file_unavailable,
   invalid_file_offset,
-  corrupt_group
+  corrupt_group,
+  commit_lost
 };
 
 }
@@ -76,6 +75,7 @@ template <> struct quick_status_code_from_enum<Error> : quick_status_code_from_e
     {Error::mapped_file_unavailable, "mapped file unavailable", {errc::bad_address}},
     {Error::invalid_file_offset, "invalid file offset", {errc::result_out_of_range}},
     {Error::corrupt_group, "corrupt grouped record", {errc::illegal_byte_sequence}},
+    {Error::commit_lost, "commit lost", {errc::operation_canceled}},
     };
     return v;
   }
@@ -86,6 +86,7 @@ namespace borinkdb::log::file {
 
 namespace outcome = OUTCOME_V2_NAMESPACE::experimental;
 namespace llfio = LLFIO_V2_NAMESPACE;
+using byteview = std::span<const std::byte>;
 
 inline constexpr std::array<std::byte, 4> kBlockMagic = {
     std::byte{'B'}, std::byte{'D'}, std::byte{'B'}, std::byte{'1'},
@@ -113,9 +114,10 @@ struct EncodeRequest {
     uint64_t ts_counter;
     uint64_t random_id;
     std::optional<GroupInfo> group;
+
     std::string_view key;
-    std::span<const std::byte> meta_bytes;
-    std::span<const std::byte> payload_bytes;
+    byteview meta_bytes;
+    byteview payload_bytes;
 };
 
 struct DecodedBlock {
@@ -124,14 +126,14 @@ struct DecodedBlock {
     uint64_t random_id;
     std::optional<GroupInfo> group;
     std::string_view key;
-    std::span<const std::byte> meta_bytes;
-    std::span<const std::byte> payload_bytes;
+    byteview meta_bytes;
+    byteview payload_bytes;
     std::size_t total_size;
 };
 
 bool is_grouped(BlockKind k) noexcept;
 outcome::status_result<std::vector<std::byte>> encode_block(const EncodeRequest &req);
-outcome::status_result<DecodedBlock>           decode_block(std::span<const std::byte> input) noexcept;
+outcome::status_result<DecodedBlock>           decode_block(byteview input) noexcept;
 
 enum class CommitOutcome { Success, Lost };
 
@@ -143,8 +145,8 @@ struct CommitResult {
 
 struct LogRecordView {
     uint64_t                   counter;
-    std::span<const std::byte> meta_bytes;
-    std::span<const std::byte> payload_bytes;
+    byteview meta_bytes;
+    byteview payload_bytes;
 };
 
 enum class LogReadMode { Cached, Refresh };
@@ -162,15 +164,15 @@ public:
 
     outcome::status_result<CommitResult> commit_standalone(
         std::string_view key,
-        std::span<const std::byte> meta_bytes,
-        std::span<const std::byte> payload_bytes);
+        byteview meta_bytes,
+        byteview payload_bytes);
 
     outcome::status_result<CommitResult> commit_wait();
 
     outcome::status_result<CommitResult> commit_payload(
         std::string_view key,
-        std::span<const std::byte> meta_bytes,
-        std::span<const std::byte> payload_bytes);
+        byteview meta_bytes,
+        byteview payload_bytes);
 
     [[nodiscard]] uint64_t latest_counter()  const noexcept { return latest_ts_; }
     [[nodiscard]] uint64_t scanned_through() const noexcept { return scanned_through_offset_; }
@@ -180,6 +182,7 @@ private:
 
     using BlockVisitor = std::function<void(uint64_t file_offset, const DecodedBlock &)>;
 
+    // review: explain the contract of this function
     outcome::status_result<uint64_t>      scan_range(uint64_t start, uint64_t end,
                                                                      const BlockVisitor &visit);
     outcome::status_result<void>           refresh_tail();
@@ -208,7 +211,7 @@ public:
 
     // Returns a borrowed payload view — invalidated by the next call that may
     // refresh the mapping or reuse grouped scratch storage.
-    outcome::status_result<std::optional<std::span<const std::byte>>>
+    outcome::status_result<std::optional<byteview>>
         get_payload_view(std::string_view key);
 
     outcome::status_result<std::optional<LogRecordView>>
@@ -244,10 +247,10 @@ private:
 
     outcome::status_result<void>                    refresh_index();
     outcome::status_result<LogRecordView>           record_view_at(uint64_t file_offset);
-    outcome::status_result<std::span<const std::byte>> payload_view_at(uint64_t file_offset);
-    outcome::status_result<std::span<const std::byte>> mapped_bytes();
+    outcome::status_result<byteview> payload_view_at(uint64_t file_offset);
+    outcome::status_result<byteview> mapped_bytes();
     void maybe_index_value(uint64_t file_offset, uint64_t ts_counter,
-                           std::string_view key, std::span<const std::byte> payload_bytes);
+                           std::string_view key, byteview payload_bytes);
 
     llfio::mapped_file_handle mapped_h_;
     uint64_t  scanned_through_offset_ = 0;

@@ -5,12 +5,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
-#include <outcome/experimental/status-code/include/status-code/system_code.hpp>
 #include <outcome/try.hpp>
 
 namespace borinkdb::log::file {
-
-// namespace outcome = OUTCOME_V2_NAMESPACE::experimental;
 
 constexpr std::size_t kMagicSize = kBlockMagic.size();
 constexpr std::size_t kTotalLenSize = 2;
@@ -31,7 +28,9 @@ bool kind_is_known(uint8_t raw) noexcept {
     return raw <= static_cast<uint8_t>(BlockKind::GroupLast);
 }
 
-std::size_t find_magic(std::span<const std::byte> bytes, std::size_t start) {
+// review: explain the contract of this function
+std::size_t find_magic(byteview bytes, std::size_t start) {
+    // review: please explain
     if (bytes.size() < kBlockMagic.size() || start > bytes.size() - kBlockMagic.size()) {
         return bytes.size();
     }
@@ -111,7 +110,8 @@ outcome::status_result<std::vector<std::byte>> encode_block(const EncodeRequest&
     return out;
 }
 
-outcome::status_result<DecodedBlock> decode_block(std::span<const std::byte> input) noexcept {
+outcome::status_result<DecodedBlock> decode_block(byteview input) noexcept {
+    // review: This is constexpr, right?
     const std::size_t min_size =
         kFixedHeaderPrefix + 1 + kRandomIdSize + kKeyLenSize + kMetaLenSize + kPayloadLenSize + kCrcSize;
     if (input.size() < min_size) {
@@ -172,14 +172,14 @@ outcome::status_result<DecodedBlock> decode_block(std::span<const std::byte> inp
     if (p + meta_len > end_excl_crc) {
         return Error::malformed_block;
     }
-    std::span<const std::byte> meta_bytes{p, meta_len};
+    byteview meta_bytes{p, meta_len};
     p += meta_len;
 
     const uint16_t payload_len = detail::read_u16_le(p);
     if (p + payload_len != end_excl_crc) {
         return Error::malformed_block;
     }
-    std::span<const std::byte> payload_bytes{p, payload_len};
+    byteview payload_bytes{p, payload_len};
 
     const std::byte* expected_crc_p = input.data() + (total_len - kCrcSize);
     const uint32_t expected_crc = detail::read_u32_le(expected_crc_p);
@@ -235,10 +235,14 @@ outcome::status_result<uint64_t> LogWriter::scan_range(uint64_t start_offset,
     uint64_t cursor = start_offset;
     uint64_t consumed = start_offset;
 
+    // review: explain very concisely the steps and what we are doing
+    // in particular, explain the more difficult components
     while (cursor < end_offset) {
         const uint64_t want = std::min<uint64_t>(kReaderChunkBytes, end_offset - cursor);
+        // review: is this resize necessary if we already give the length to rb, can we not just give want there
         chunk.resize(static_cast<std::size_t>(want));
 
+        // review: rb, rbs, rr are very unclear variable names
         llfio::file_handle::buffer_type rb{chunk.data(), chunk.size()};
         llfio::file_handle::buffers_type rbs{&rb, 1};
         OUTCOME_TRY(auto rr, read_h_.read({rbs, cursor}));
@@ -252,7 +256,7 @@ outcome::status_result<uint64_t> LogWriter::scan_range(uint64_t start_offset,
         chunk.resize(got);
         cursor += got;
 
-        std::span<const std::byte> view;
+        byteview view;
         if (carry.empty()) {
             view = {chunk.data(), chunk.size()};
         } else {
@@ -265,8 +269,10 @@ outcome::status_result<uint64_t> LogWriter::scan_range(uint64_t start_offset,
 
         std::size_t pos = 0;
         while (pos < view.size()) {
+            // review: d is very unclear variable name
             auto d = decode_block(view.subspan(pos));
             if (!d) {
+                // review: why do we compare to generic error code instead of the specific ones we know decode_block can return?
                 if (d.error().equivalent(system_error2::make_status_code(system_error2::errc::message_size))) {
                     break;
                 }
@@ -295,6 +301,7 @@ outcome::status_result<void> LogWriter::refresh_tail() {
         return llfio::success();
     }
 
+    // review: explain the visitor and what it does
     OUTCOME_TRY(auto consumed, scan_range(scanned_through_offset_, end,
                                      [this](uint64_t, const DecodedBlock& blk) {
                                          latest_ts_ = std::max(latest_ts_, blk.ts_counter);
@@ -392,8 +399,8 @@ outcome::status_result<CommitResult> LogWriter::commit_blocks(std::vector<std::v
 
 outcome::status_result<CommitResult> LogWriter::commit_standalone(
     std::string_view key,
-    std::span<const std::byte> meta_bytes,
-    std::span<const std::byte> payload_bytes) {
+    byteview meta_bytes,
+    byteview payload_bytes) {
     OUTCOME_TRYV(refresh_tail());
     const uint64_t our_ts = latest_ts_ + 1;
     const uint64_t our_id = rng_();
@@ -406,6 +413,7 @@ outcome::status_result<CommitResult> LogWriter::commit_standalone(
         .meta_bytes = meta_bytes,
         .payload_bytes = payload_bytes,
     }));
+    // review: could we avoid having to allocate a vector in this case, as this is the common case
     std::vector<std::vector<std::byte>> blocks;
     blocks.push_back(std::move(encoded));
     return commit_blocks(std::move(blocks), our_ts, our_id, std::nullopt);
@@ -415,7 +423,7 @@ outcome::status_result<CommitResult> LogWriter::commit_wait() {
     OUTCOME_TRYV(refresh_tail());
     const uint64_t our_ts = latest_ts_ + 1;
     const uint64_t our_id = rng_();
-    const std::span<const std::byte> empty;
+    const byteview empty;
     OUTCOME_TRY(auto encoded, encode_block({
         .kind = BlockKind::Wait,
         .ts_counter = our_ts,
@@ -432,8 +440,8 @@ outcome::status_result<CommitResult> LogWriter::commit_wait() {
 
 outcome::status_result<CommitResult> LogWriter::commit_payload(
     std::string_view key,
-    std::span<const std::byte> meta_bytes,
-    std::span<const std::byte> payload_bytes) {
+    byteview meta_bytes,
+    byteview payload_bytes) {
     auto single_probe = encode_block({
         .kind = BlockKind::Standalone,
         .ts_counter = latest_ts_ + 1,
@@ -443,8 +451,10 @@ outcome::status_result<CommitResult> LogWriter::commit_payload(
         .meta_bytes = meta_bytes,
         .payload_bytes = payload_bytes,
     });
+    // review: try to look for the more specific error code instead of the generic one
     if (single_probe ||
         !single_probe.error().equivalent(system_error2::make_status_code(system_error2::errc::message_size))) {
+        // review: aren't we now still committing in case there is some other error?
         return commit_standalone(key, meta_bytes, payload_bytes);
     }
     OUTCOME_TRYV(refresh_tail());
@@ -463,10 +473,11 @@ outcome::status_result<CommitResult> LogWriter::commit_payload(
     for (uint16_t i = 0; i < count; ++i) {
         const std::size_t begin = static_cast<std::size_t>(i) * kChunkPayloadBytes;
         const std::size_t n = std::min(kChunkPayloadBytes, payload_bytes.size() - begin);
+        // review: this groupfirst/groupmid/grouplast seems a bit unnecessary, why do these all need to be special cases?
         const auto kind = i == 0 ? BlockKind::GroupFirst
                          : (i + 1 == count ? BlockKind::GroupLast : BlockKind::GroupMid);
         const auto block_key = i == 0 ? key : std::string_view{};
-        const auto meta = i == 0 ? meta_bytes : std::span<const std::byte>{};
+        const auto meta = i == 0 ? meta_bytes : byteview{};
         OUTCOME_TRY(auto encoded, encode_block({
             .kind = kind,
             .ts_counter = our_ts,
@@ -478,6 +489,7 @@ outcome::status_result<CommitResult> LogWriter::commit_payload(
         }));
         blocks.push_back(std::move(encoded));
     }
+    // review: why do we construct vector and pass it instead of just inlining the (limited) logic in commit_blocks and then reduce allocations
     return commit_blocks(std::move(blocks), our_ts, our_id, count);
 }
 
@@ -527,7 +539,7 @@ std::string_view LogReader::KeyArena::store(std::string_view key) {
 void LogReader::maybe_index_value(uint64_t file_offset,
                                   uint64_t ts_counter,
                                   std::string_view key,
-                                  std::span<const std::byte>) {
+                                  byteview) {
     if (key.empty()) {
         return;
     }
@@ -547,19 +559,19 @@ void LogReader::maybe_index_value(uint64_t file_offset,
     });
 }
 
-outcome::status_result<std::span<const std::byte>> LogReader::mapped_bytes() {
+outcome::status_result<byteview> LogReader::mapped_bytes() {
     OUTCOME_TRY(auto extent, mapped_h_.update_map());
     if (extent == 0) {
-        return std::span<const std::byte>{};
+        return byteview{};
     }
     const auto* p = reinterpret_cast<const std::byte*>(mapped_h_.address());
     if (p == nullptr) {
         return Error::mapped_file_unavailable;
     }
-    return std::span<const std::byte>{p, static_cast<std::size_t>(extent)};
+    return byteview{p, static_cast<std::size_t>(extent)};
 }
 
-outcome::status_result<std::span<const std::byte>> LogReader::payload_view_at(uint64_t file_offset) {
+outcome::status_result<byteview> LogReader::payload_view_at(uint64_t file_offset) {
     OUTCOME_TRY(auto mapped, mapped_bytes());
     if (file_offset >= mapped.size()) {
         return Error::invalid_file_offset;
@@ -612,7 +624,7 @@ outcome::status_result<std::span<const std::byte>> LogReader::payload_view_at(ui
             block.payload_bytes.end());
         next_offset += block.total_size;
     }
-    return std::span<const std::byte>{grouped_payload_scratch_.data(), grouped_payload_scratch_.size()};
+    return byteview{grouped_payload_scratch_.data(), grouped_payload_scratch_.size()};
 }
 
 outcome::status_result<void> LogReader::refresh_index() {
@@ -640,6 +652,8 @@ outcome::status_result<void> LogReader::refresh_index() {
     while (pos < view.size()) {
         auto decoded = decode_block(view.subspan(pos));
         if (!decoded) {
+            // review: i want to be more careful here about which error codes we are okay with and which we aren't
+            // we should be very explicit
             if (decoded.error().equivalent(system_error2::make_status_code(system_error2::errc::message_size))) {
                 break;
             }
@@ -662,6 +676,7 @@ outcome::status_result<void> LogReader::refresh_index() {
             if (committed_counters_.insert(blk.ts_counter).second) {
                 maybe_index_value(offset, blk.ts_counter, blk.key, blk.payload_bytes);
             }
+        // review: like what i said above it seems like we need a lot of code for the group handling
         } else if (blk.kind == BlockKind::GroupFirst && blk.group && blk.group->index == 0) {
             if (committed_counters_.contains(blk.ts_counter)) {
                 group.active = false;
@@ -678,7 +693,7 @@ outcome::status_result<void> LogReader::refresh_index() {
             group.key.assign(blk.key.data(), blk.key.size());
             if (group.count == 1) {
                 if (committed_counters_.insert(group.ts).second) {
-                    maybe_index_value(group.first_offset, group.ts, group.key, std::span<const std::byte>{});
+                    maybe_index_value(group.first_offset, group.ts, group.key, byteview{});
                 }
                 group.active = false;
             }
@@ -695,7 +710,7 @@ outcome::status_result<void> LogReader::refresh_index() {
                 ++group.next_index;
                 if (is_last) {
                     if (committed_counters_.insert(group.ts).second) {
-                        maybe_index_value(group.first_offset, group.ts, group.key, std::span<const std::byte>{});
+                        maybe_index_value(group.first_offset, group.ts, group.key, byteview{});
                     }
                     group.active = false;
                 }
@@ -730,6 +745,7 @@ outcome::status_result<LogRecordView> LogReader::record_view_at(uint64_t file_of
     const auto offset = static_cast<std::size_t>(file_offset);
     auto first = decode_block(mapped.subspan(offset));
     if (!first) {
+        // review: why don't we use OUTCOME_TRY here?
         return std::move(first).as_failure();
     }
 
@@ -744,7 +760,7 @@ outcome::status_result<LogRecordView> LogReader::record_view_at(uint64_t file_of
     if (first_block.kind != BlockKind::GroupFirst || !first_block.group || first_block.group->index != 0) {
         return Error::corrupt_group;
     }
-
+    // review: again, a lot of code for group handling. try to simplify
     grouped_payload_scratch_.clear();
     grouped_payload_scratch_.reserve(static_cast<std::size_t>(first_block.group->count) * 800);
     grouped_payload_scratch_.insert(
@@ -797,12 +813,12 @@ outcome::status_result<std::optional<LogRecordView>> LogReader::get_record_view(
     return std::optional<LogRecordView>{std::move(record)};
 }
 
-outcome::status_result<std::optional<std::span<const std::byte>>> LogReader::get_payload_view(std::string_view key) {
+outcome::status_result<std::optional<byteview>> LogReader::get_payload_view(std::string_view key) {
     OUTCOME_TRY(auto record, get_record_view(key, LogReadMode::Refresh));
     if (!record.has_value()) {
-        return std::optional<std::span<const std::byte>>{};
+        return std::optional<byteview>{};
     }
-    return std::optional<std::span<const std::byte>>{record->payload_bytes};
+    return std::optional<byteview>{record->payload_bytes};
 }
 
 }
