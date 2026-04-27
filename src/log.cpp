@@ -64,21 +64,22 @@ struct CommitScanState {
     uint64_t our_ts;
     uint64_t our_id;
     std::optional<uint16_t> group_count;
+    std::vector<bool>& matched_group_blocks;
     bool found_our_ts = false;
     CommitOutcome outcome = CommitOutcome::Lost;
-    uint16_t matched_group_blocks = 0;
-    uint64_t expected_next_offset = 0;
+    uint16_t matched_group_count = 0;
 
     void observe(uint64_t offset, const DecodedBlock& blk) {
+        (void) offset;
         if (!found_our_ts) {
-            observe_first_candidate(offset, blk);
+            observe_first_candidate(blk);
             return;
         }
-        observe_group_continuation(offset, blk);
+        observe_group_continuation(blk);
     }
 
 private:
-    void observe_first_candidate(uint64_t offset, const DecodedBlock& blk) {
+    void observe_first_candidate(const DecodedBlock& blk) {
         if (blk.ts_counter != our_ts) {
             return;
         }
@@ -96,34 +97,37 @@ private:
             blk.group &&
             blk.group->index == 0 &&
             blk.group->count == *group_count) {
-            matched_group_blocks = 1;
-            expected_next_offset = offset + blk.total_size;
+            matched_group_blocks.assign(*group_count, false);
+            matched_group_blocks[0] = true;
+            matched_group_count = 1;
             outcome = (*group_count == 1) ? CommitOutcome::Success : CommitOutcome::Lost;
         }
     }
 
-    void observe_group_continuation(uint64_t offset, const DecodedBlock& blk) {
+    void observe_group_continuation(const DecodedBlock& blk) {
         if (!group_count ||
             outcome != CommitOutcome::Lost ||
-            matched_group_blocks == 0 ||
-            matched_group_blocks >= *group_count) {
+            matched_group_count == 0 ||
+            matched_group_count >= *group_count) {
             return;
         }
 
-        if (offset != expected_next_offset ||
-            blk.ts_counter != our_ts ||
+        if (blk.ts_counter != our_ts ||
             blk.random_id != our_id ||
             blk.kind != BlockKind::Group ||
             !blk.group ||
-            blk.group->index != matched_group_blocks ||
             blk.group->count != *group_count) {
-            matched_group_blocks = 0;
             return;
         }
 
-        ++matched_group_blocks;
-        expected_next_offset = offset + blk.total_size;
-        if (matched_group_blocks == *group_count) {
+        if (blk.group->index >= matched_group_blocks.size()) {
+            return;
+        }
+        if (!matched_group_blocks[blk.group->index]) {
+            matched_group_blocks[blk.group->index] = true;
+            ++matched_group_count;
+        }
+        if (matched_group_count == *group_count) {
             outcome = CommitOutcome::Success;
         }
     }
@@ -493,10 +497,12 @@ outcome::status_result<CommitOutcome> LogFile::resolve_outcome(uint64_t our_ts,
         return CommitOutcome::Lost;
     }
 
+    group_match_scratch_.clear();
     CommitScanState state{
         .our_ts = our_ts,
         .our_id = our_id,
         .group_count = group_count,
+        .matched_group_blocks = group_match_scratch_,
     };
     auto scan_result = scan_range(mapped, scanned_through_offset_, end,
                                   [&](uint64_t offset, const DecodedBlock& blk) {
@@ -579,16 +585,18 @@ outcome::status_result<CommitResult> LogFile::commit_payload(
         return std::move(single_probe).as_failure();
     }
 
-    constexpr std::size_t kChunkPayloadBytes = 800;
-    const std::size_t count_sz = (payload_bytes.size() + kChunkPayloadBytes - 1) / kChunkPayloadBytes;
-    if (count_sz == 0 || count_sz > 0xFFFFu) {
+    const std::size_t count_sz = (payload_bytes.size() + kGroupPayloadChunkBytes - 1) / kGroupPayloadChunkBytes;
+    if (count_sz == 0) {
         return Error::payload_too_large;
+    }
+    if (count_sz > kMaxGroupBlocks) {
+        return Error::too_many_group_blocks;
     }
     const auto count = static_cast<uint16_t>(count_sz);
 
     for (uint16_t i = 0; i < count; ++i) {
-        const std::size_t begin = static_cast<std::size_t>(i) * kChunkPayloadBytes;
-        const std::size_t n = std::min(kChunkPayloadBytes, payload_bytes.size() - begin);
+        const std::size_t begin = static_cast<std::size_t>(i) * kGroupPayloadChunkBytes;
+        const std::size_t n = std::min(kGroupPayloadChunkBytes, payload_bytes.size() - begin);
         const auto block_key = i == 0 ? key : std::string_view{};
         const auto meta = i == 0 ? meta_bytes : byteview{};
         OUTCOME_TRY(auto encoded, encode_block({
@@ -669,44 +677,57 @@ outcome::status_result<byteview> LogFile::current_mapped_bytes() const {
     return byteview{p, static_cast<std::size_t>(extent)};
 }
 
-void LogFile::index_block(uint64_t file_offset, const DecodedBlock& blk, PendingGroup& group) {
+outcome::status_result<bool> LogFile::group_is_complete(byteview mapped,
+                                                        uint64_t file_offset,
+                                                        const DecodedBlock& first_block) {
+    if (first_block.kind != BlockKind::Group ||
+        !first_block.group ||
+        first_block.group->index != 0) {
+        return false;
+    }
+    if (first_block.group->count == 1) {
+        return true;
+    }
+
+    std::vector<bool> seen(first_block.group->count, false);
+    seen[0] = true;
+    uint16_t seen_count = 1;
+    OUTCOME_TRYV(scan_range(
+        mapped,
+        file_offset + first_block.total_size,
+        mapped.size(),
+        [&](uint64_t, const DecodedBlock& block) {
+            if (seen_count == first_block.group->count) {
+                return;
+            }
+        if (block.ts_counter == first_block.ts_counter &&
+            block.random_id == first_block.random_id &&
+            block.kind == BlockKind::Group &&
+            block.group &&
+            block.group->count == first_block.group->count &&
+            !seen[block.group->index]) {
+            seen[block.group->index] = true;
+            ++seen_count;
+        }
+        }));
+    return seen_count == first_block.group->count;
+}
+
+outcome::status_result<void> LogFile::index_block(byteview mapped, uint64_t file_offset, const DecodedBlock& blk) {
+    auto [first_it, inserted] = first_random_id_by_ts_.emplace(blk.ts_counter, blk.random_id);
+    (void) inserted;
     latest_ts_ = std::max(latest_ts_, blk.ts_counter);
 
-    if (blk.kind == BlockKind::Group && blk.group && blk.group->index == 0) {
-        group.active = true;
-        group.ts = blk.ts_counter;
-        group.id = blk.random_id;
-        group.first_offset = file_offset;
-        group.expected_offset = file_offset + blk.total_size;
-        group.next_index = 1;
-        group.count = blk.group->count;
-        group.key.assign(blk.key.data(), blk.key.size());
-        if (group.count == 1) {
-            maybe_index_value(group.first_offset, group.ts, group.key);
-            group.active = false;
-        }
-        return;
-    }
-
-    if (group.active &&
+    if (first_it->second == blk.random_id &&
         blk.kind == BlockKind::Group &&
         blk.group &&
-        file_offset == group.expected_offset &&
-        blk.ts_counter == group.ts &&
-        blk.random_id == group.id &&
-        blk.group->index == group.next_index &&
-        blk.group->count == group.count) {
-        const bool is_last = group.next_index + 1 == group.count;
-        group.expected_offset = file_offset + blk.total_size;
-        ++group.next_index;
-        if (is_last) {
-            maybe_index_value(group.first_offset, group.ts, group.key);
-            group.active = false;
+        blk.group->index == 0) {
+        OUTCOME_TRY(auto complete, group_is_complete(mapped, file_offset, blk));
+        if (complete) {
+            maybe_index_value(file_offset, blk.ts_counter, blk.key);
         }
-        return;
     }
-
-    group.active = false;
+    return outcome::success();
 }
 
 outcome::status_result<void> LogFile::refresh_index() {
@@ -716,17 +737,20 @@ outcome::status_result<void> LogFile::refresh_index() {
         return outcome::success();
     }
 
-    PendingGroup group;
+    outcome::status_result<void> index_result = outcome::success();
     OUTCOME_TRY(auto consumed, scan_range(
         mapped,
         scanned_through_offset_,
         end_offset,
         [&](uint64_t offset, const DecodedBlock& blk) {
-            index_block(offset, blk, group);
-        },
-        [&]() {
-            group.active = false;
+            if (!index_result) {
+                return;
+            }
+            index_result = index_block(mapped, offset, blk);
         }));
+    if (!index_result) {
+        return index_result;
+    }
     scanned_through_offset_ = consumed;
     return outcome::success();
 }
@@ -734,6 +758,31 @@ outcome::status_result<void> LogFile::refresh_index() {
 outcome::status_result<void> LogFile::refresh() {
     std::lock_guard lock(mutex_);
     return refresh_index();
+}
+
+outcome::status_result<void> LogFile::visit_records(const RecordVisitor& visit) {
+    std::lock_guard lock(mutex_);
+    OUTCOME_TRYV(refresh_index());
+    OUTCOME_TRY(auto mapped, current_mapped_bytes());
+
+    outcome::status_result<void> visit_result = outcome::success();
+    OUTCOME_TRYV(scan_range(
+        mapped,
+        0,
+        mapped.size(),
+        [&](uint64_t offset, const DecodedBlock& blk) {
+            if (!visit_result || blk.kind != BlockKind::Group || !blk.group || blk.group->index != 0 || blk.key.empty()) {
+                return;
+            }
+
+            auto record = record_view_at(offset);
+            if (!record) {
+                visit_result = std::move(record).as_failure();
+                return;
+            }
+            visit(blk.key, record.value());
+        }));
+    return visit_result;
 }
 
 outcome::status_result<LogRecordView> LogFile::record_view_at(uint64_t file_offset) {
@@ -750,24 +799,38 @@ outcome::status_result<LogRecordView> LogFile::record_view_at(uint64_t file_offs
 
     PayloadBlockList payload_blocks;
     payload_blocks.reserve(first_block.group->count);
-    payload_blocks.push_back(first_block.payload_bytes);
 
-    uint64_t next_offset = file_offset + first_block.total_size;
-    for (uint16_t next_index = 1; next_index < first_block.group->count; ++next_index) {
-        if (next_offset >= mapped.size()) {
-            return Error::invalid_file_offset;
-        }
-        OUTCOME_TRY(auto block, decode_block(mapped.subspan(static_cast<std::size_t>(next_offset))));
-        if (block.kind != BlockKind::Group ||
-            !block.group ||
-            block.group->index != next_index ||
-            block.group->count != first_block.group->count ||
-            block.ts_counter != first_block.ts_counter ||
-            block.random_id != first_block.random_id) {
-            return Error::corrupt_group;
-        }
-        payload_blocks.push_back(block.payload_bytes);
-        next_offset += block.total_size;
+    std::vector<byteview> blocks(first_block.group->count);
+    std::vector<bool> seen(first_block.group->count, false);
+    blocks[0] = first_block.payload_bytes;
+    seen[0] = true;
+    uint16_t seen_count = 1;
+
+    OUTCOME_TRYV(scan_range(
+        mapped,
+        file_offset + first_block.total_size,
+        mapped.size(),
+        [&](uint64_t, const DecodedBlock& block) {
+            if (seen_count == first_block.group->count) {
+                return;
+            }
+            if (block.kind == BlockKind::Group &&
+                block.group &&
+                block.group->count == first_block.group->count &&
+                block.ts_counter == first_block.ts_counter &&
+                block.random_id == first_block.random_id &&
+                !seen[block.group->index]) {
+                blocks[block.group->index] = block.payload_bytes;
+                seen[block.group->index] = true;
+                ++seen_count;
+            }
+        }));
+
+    if (seen_count != first_block.group->count) {
+        return Error::corrupt_group;
+    }
+    for (const auto block : blocks) {
+        payload_blocks.push_back(block);
     }
     return LogRecordView(first_block.ts_counter, first_block.meta_bytes, std::move(payload_blocks));
 }

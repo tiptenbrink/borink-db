@@ -25,18 +25,25 @@ FileLog::FileLog(FileLog&&) = default;
 FileLog& FileLog::operator=(FileLog&&) = default;
 FileLog::~FileLog() = default;
 
-outcome::status_result<uint64_t> FileLog::put(std::string_view key, byteview meta, byteview payload) {
+outcome::status_result<PutResult> FileLog::put(std::string_view key, byteview meta, byteview payload) {
     OUTCOME_TRY(auto result, impl_->log->commit_payload(key, meta, payload));
 
     if (result.outcome == log::file::CommitOutcome::Lost) {
-        return log::file::Error::commit_lost;
+        return PutResult{
+            .outcome = PutOutcome::Retry,
+            .counter = result.ts_counter,
+        };
     }
 
-    return result.ts_counter;
+    return PutResult{
+        .outcome = PutOutcome::Success,
+        .counter = result.ts_counter,
+    };
 }
 
 outcome::status_result<std::optional<RecordView>> FileLog::get_latest(std::string_view key, ReadOptions options) {
     log::file::LogReadMode read_mode = log::file::LogReadMode::Refresh;
+    // TODO: make this nicer
     switch (options) {
         case ReadOptions::Refresh:
             read_mode = log::file::LogReadMode::Refresh;

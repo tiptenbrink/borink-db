@@ -34,14 +34,24 @@ struct RecordView {
     std::vector<byteview> payload_blocks;
 };
 
+enum class PutOutcome {
+    Success,
+    Retry,
+};
+
+struct PutResult {
+    PutOutcome outcome = PutOutcome::Retry;
+    uint64_t counter = 0;
+};
 
 class Log {
 public:
     virtual ~Log() = default;
 
-    // Append one logical value. A Committed result means fresh reads should return this
-    // value until a higher counter for the same key is committed.
-    virtual outcome::status_result<uint64_t> put(std::string_view key, byteview meta, byteview payload) = 0;
+    // Append one logical value. Success means fresh reads should return this
+    // value until a higher counter for the same key is committed. Retry means
+    // another writer won the current counter race; callers should try again.
+    virtual outcome::status_result<PutResult> put(std::string_view key, byteview meta, byteview payload) = 0;
 
     // Refresh the backend's view of storage as needed and return the latest
     // committed value for key. Returned spans are borrowed from the backend and
@@ -67,7 +77,7 @@ public:
     FileLog(const FileLog&) = delete;
     FileLog& operator=(const FileLog&) = delete;
 
-    outcome::status_result<uint64_t> put(std::string_view key, byteview meta, byteview payload) override;
+    outcome::status_result<PutResult> put(std::string_view key, byteview meta, byteview payload) override;
     outcome::status_result<std::optional<RecordView>>
         get_latest(std::string_view key, ReadOptions options = ReadOptions::Refresh) override;
     outcome::status_result<void> refresh() override;

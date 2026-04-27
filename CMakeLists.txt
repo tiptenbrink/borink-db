@@ -16,6 +16,7 @@ find_package(reflectcpp CONFIG REQUIRED)
 
 add_executable(borink_db
     src/main.cpp
+    src/bench.cpp
     src/mimalloc.cpp
     src/byte_io.cpp
     src/crc32c.cpp
@@ -27,6 +28,9 @@ target_compile_options(borink_db PRIVATE
     $<$<CXX_COMPILER_ID:Clang>:-Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Wshadow -Wnon-virtual-dtor -Wold-style-cast -Woverloaded-virtual -Wnull-dereference -Wdouble-promotion -Wformat=2 -Wimplicit-fallthrough -Werror>
     $<$<CXX_COMPILER_ID:GNU>:-Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Wshadow -Wnon-virtual-dtor -Wold-style-cast -Woverloaded-virtual -Wnull-dereference -Wdouble-promotion -Wformat=2 -Wimplicit-fallthrough -Werror>
 )
-target_compile_definitions(borink_db PRIVATE LLFIO_UNSTABLE_VERSION=1)
+target_compile_definitions(borink_db PRIVATE
+    LLFIO_UNSTABLE_VERSION=1
+    $<$<CONFIG:Debug>:BORINKDB_DEBUG_TESTS=1>
+)
 
 install(TARGETS borink_db RUNTIME DESTINATION bin)

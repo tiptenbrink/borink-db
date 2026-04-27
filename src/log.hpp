@@ -34,6 +34,7 @@ enum class Error
   key_too_large,
   metadata_too_large,
   payload_too_large,
+  too_many_group_blocks,
   block_too_large,
   truncated_block,
   invalid_magic,
@@ -44,8 +45,7 @@ enum class Error
   short_write,
   mapped_file_unavailable,
   invalid_file_offset,
-  corrupt_group,
-  commit_lost
+  corrupt_group
 };
 
 }
@@ -70,6 +70,7 @@ template <> struct quick_status_code_from_enum<Error> : quick_status_code_from_e
     {Error::key_too_large, "key too large", {errc::message_size}},
     {Error::metadata_too_large, "metadata too large", {errc::message_size}},
     {Error::payload_too_large, "payload too large", {errc::message_size}},
+    {Error::too_many_group_blocks, "too many group blocks", {errc::message_size}},
     {Error::block_too_large, "block too large", {errc::message_size}},
     {Error::truncated_block, "truncated block", {errc::message_size}},
     {Error::invalid_magic, "invalid block magic", {errc::illegal_byte_sequence}},
@@ -81,7 +82,6 @@ template <> struct quick_status_code_from_enum<Error> : quick_status_code_from_e
     {Error::mapped_file_unavailable, "mapped file unavailable", {errc::bad_address}},
     {Error::invalid_file_offset, "invalid file offset", {errc::result_out_of_range}},
     {Error::corrupt_group, "corrupt grouped record", {errc::illegal_byte_sequence}},
-    {Error::commit_lost, "commit lost", {errc::operation_canceled}},
     };
     return v;
   }
@@ -99,6 +99,12 @@ inline constexpr std::array<std::byte, 4> kBlockMagic = {
 };
 inline constexpr std::size_t kMaxBlockBytes = 1024;
 inline constexpr std::size_t kReaderMapReservationBytes = 64ull * 1024 * 1024 * 1024;
+inline constexpr std::size_t kGroupPayloadChunkBytes = 800;
+// Group index/count are u16 on disk, so one logical record can contain at most
+// 0xFFFF group blocks, i.e. 65,535 blocks. With 800 payload bytes per block,
+// the maximum grouped payload is 52,428,000 bytes, about 50.0 MiB.
+inline constexpr std::size_t kMaxGroupBlocks = 0xFFFFu;
+inline constexpr std::size_t kMaxGroupedPayloadBytes = kGroupPayloadChunkBytes * kMaxGroupBlocks;
 
 enum class BlockKind : uint8_t {
     Wait       = 0,
@@ -107,6 +113,7 @@ enum class BlockKind : uint8_t {
 };
 
 struct GroupInfo {
+    // Encoded as u16 fields on disk. This is the source of kMaxGroupBlocks.
     uint16_t index;
     uint16_t count;
 };
@@ -269,6 +276,9 @@ public:
 
     outcome::status_result<void> refresh();
 
+    using RecordVisitor = std::function<void(std::string_view key, const LogRecordView& record)>;
+    outcome::status_result<void> visit_records(const RecordVisitor& visit);
+
     [[nodiscard]] uint64_t latest_counter() const;
     [[nodiscard]] uint64_t scanned_through() const;
 
@@ -291,17 +301,6 @@ private:
     void refresh_from_watcher() noexcept;
 
     struct IndexedValue { uint64_t ts_counter; uint64_t file_offset; };
-    struct PendingGroup {
-        bool active = false;
-        uint64_t ts = 0;
-        uint64_t id = 0;
-        uint64_t first_offset = 0;
-        uint64_t expected_offset = 0;
-        uint16_t next_index = 0;
-        uint16_t count = 0;
-        std::string key;
-    };
-
     struct KeyHash {
         using is_transparent = void;
         std::size_t operator()(std::string_view s) const noexcept;
@@ -321,7 +320,8 @@ private:
     };
 
     outcome::status_result<void>                    refresh_index();
-    void index_block(uint64_t file_offset, const DecodedBlock& blk, PendingGroup& group);
+    outcome::status_result<bool> group_is_complete(byteview mapped, uint64_t file_offset, const DecodedBlock& first_block);
+    outcome::status_result<void> index_block(byteview mapped, uint64_t file_offset, const DecodedBlock& blk);
     outcome::status_result<LogRecordView>           record_view_at(uint64_t file_offset);
     outcome::status_result<byteview> mapped_bytes();
     outcome::status_result<byteview> current_mapped_bytes() const;
@@ -336,7 +336,9 @@ private:
     uint64_t  scanned_through_offset_ = 0;
     uint64_t  latest_ts_              = 0;
     KeyArena  key_arena_;
+    std::unordered_map<uint64_t, uint64_t> first_random_id_by_ts_;
     std::unordered_map<std::string_view, IndexedValue, KeyHash, KeyEqual> latest_by_key_;
+    std::vector<bool> group_match_scratch_;
     std::unique_ptr<FileWatcher> watcher_;
 };
 
