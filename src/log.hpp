@@ -13,6 +13,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <array>
 #include <atomic>
 #include <deque>
@@ -27,9 +28,6 @@ enum class Error
   success = 0,
   not_found,
   bad_argument,
-  invalid_block_kind,
-  missing_group_info,
-  unexpected_group_info,
   invalid_group_info,
   key_too_large,
   metadata_too_large,
@@ -39,7 +37,7 @@ enum class Error
   truncated_block,
   invalid_magic,
   invalid_block_length,
-  invalid_timestamp_length,
+  invalid_id_length,
   malformed_block,
   checksum_mismatch,
   short_write,
@@ -63,9 +61,6 @@ template <> struct quick_status_code_from_enum<Error> : quick_status_code_from_e
     static const std::initializer_list<mapping> v = {
     {Error::not_found, "item not found", {errc::no_such_file_or_directory}},
     {Error::bad_argument, "invoked wrong", {errc::invalid_argument}},
-    {Error::invalid_block_kind, "invalid block kind", {errc::invalid_argument}},
-    {Error::missing_group_info, "group block missing group info", {errc::invalid_argument}},
-    {Error::unexpected_group_info, "non-group block has group info", {errc::invalid_argument}},
     {Error::invalid_group_info, "invalid group info", {errc::invalid_argument}},
     {Error::key_too_large, "key too large", {errc::message_size}},
     {Error::metadata_too_large, "metadata too large", {errc::message_size}},
@@ -75,7 +70,7 @@ template <> struct quick_status_code_from_enum<Error> : quick_status_code_from_e
     {Error::truncated_block, "truncated block", {errc::message_size}},
     {Error::invalid_magic, "invalid block magic", {errc::illegal_byte_sequence}},
     {Error::invalid_block_length, "invalid block length", {errc::illegal_byte_sequence}},
-    {Error::invalid_timestamp_length, "invalid timestamp length", {errc::illegal_byte_sequence}},
+    {Error::invalid_id_length, "invalid logical block id length", {errc::illegal_byte_sequence}},
     {Error::malformed_block, "malformed block", {errc::illegal_byte_sequence}},
     {Error::checksum_mismatch, "block checksum mismatch", {errc::illegal_byte_sequence}},
     {Error::short_write, "short write", {errc::io_error}},
@@ -106,50 +101,58 @@ inline constexpr std::size_t kGroupPayloadChunkBytes = 800;
 inline constexpr std::size_t kMaxGroupBlocks = 0xFFFFu;
 inline constexpr std::size_t kMaxGroupedPayloadBytes = kGroupPayloadChunkBytes * kMaxGroupBlocks;
 
-enum class BlockKind : uint8_t {
-    Wait       = 0,
-    Dictionary = 1,
-    Group      = 2,
-};
-
 struct GroupInfo {
     // Encoded as u16 fields on disk. This is the source of kMaxGroupBlocks.
     uint16_t index;
     uint16_t count;
 };
 
-struct EncodeRequest {
-    BlockKind kind;
-    uint64_t ts_counter;
-    uint64_t random_id;
-    std::optional<GroupInfo> group;
+struct BlockEntry {
+    std::string_view key = {};
+    byteview meta_bytes = {};
+    byteview payload_bytes = {};
+};
 
+struct EncodeRequest {
+    uint64_t id_hi;
+    uint64_t id_lo;
+    GroupInfo group;
+
+    std::string_view key;
+    byteview meta_bytes;
+    byteview payload_bytes;
+    std::span<const BlockEntry> entries = {};
+};
+
+struct DecodedEntry {
     std::string_view key;
     byteview meta_bytes;
     byteview payload_bytes;
 };
 
 struct DecodedBlock {
-    BlockKind kind;
-    uint64_t ts_counter;
-    uint64_t random_id;
-    std::optional<GroupInfo> group;
+    uint64_t id_hi;
+    uint64_t id_lo;
+    GroupInfo group;
     std::string_view key;
     byteview meta_bytes;
     byteview payload_bytes;
+    std::vector<DecodedEntry> entries;
     std::size_t total_size;
 };
 
-bool is_grouped(BlockKind k) noexcept;
 outcome::status_result<std::vector<std::byte>> encode_block(const EncodeRequest &req);
-outcome::status_result<DecodedBlock>           decode_block(byteview input) noexcept;
-
-enum class CommitOutcome { Success, Lost };
+outcome::status_result<DecodedBlock>           decode_block(byteview input);
 
 struct CommitResult {
-    CommitOutcome outcome;
-    uint64_t      ts_counter;
-    uint64_t      random_id;
+    uint64_t id_hi;
+    uint64_t id_lo;
+};
+
+struct TransactionEntry {
+    std::string_view key;
+    byteview meta_bytes;
+    byteview payload_bytes;
 };
 
 // Most records fit in one block, and even split records usually need only a
@@ -179,7 +182,9 @@ public:
     LogRecordView& operator=(const LogRecordView&) = delete;
     ~LogRecordView() = default;
 
-    [[nodiscard]] uint64_t counter() const noexcept { return counter_; }
+    [[nodiscard]] uint64_t id_hi() const noexcept { return id_hi_; }
+    [[nodiscard]] uint64_t id_lo() const noexcept { return id_lo_; }
+    [[nodiscard]] uint16_t group_index() const noexcept { return group_index_; }
     [[nodiscard]] byteview meta_bytes() const noexcept { return meta_bytes_; }
     [[nodiscard]] std::span<const byteview> payload_blocks() const noexcept {
         return payload_blocks_.view();
@@ -188,9 +193,11 @@ public:
 private:
     friend class LogFile;
 
-    LogRecordView(uint64_t counter, byteview meta_bytes, PayloadBlockList payload_blocks);
+    LogRecordView(uint64_t id_hi, uint64_t id_lo, uint16_t group_index, byteview meta_bytes, PayloadBlockList payload_blocks);
 
-    uint64_t counter_ = 0;
+    uint64_t id_hi_ = 0;
+    uint64_t id_lo_ = 0;
+    uint16_t group_index_ = 0;
     byteview meta_bytes_;
     PayloadBlockList payload_blocks_;
 };
@@ -250,12 +257,7 @@ public:
     LogFile& operator=(LogFile&&) = delete;
     ~LogFile();
 
-    outcome::status_result<CommitResult> commit_wait();
-
-    outcome::status_result<CommitResult> commit_payload(
-        std::string_view key,
-        byteview meta_bytes,
-        byteview payload_bytes);
+    outcome::status_result<CommitResult> commit_transaction(std::span<const TransactionEntry> entries);
 
     // Returns a borrowed log record view. Keep LogFile alive longer than any
     // view returned from it.
@@ -279,7 +281,6 @@ public:
     using RecordVisitor = std::function<void(std::string_view key, const LogRecordView& record)>;
     outcome::status_result<void> visit_records(const RecordVisitor& visit);
 
-    [[nodiscard]] uint64_t latest_counter() const;
     [[nodiscard]] uint64_t scanned_through() const;
 
 private:
@@ -295,12 +296,25 @@ private:
                                                                      const BlockVisitor &visit,
                                                                      const CorruptRangeVisitor& on_corrupt = {});
     outcome::status_result<void>           ensure_append_handle();
-    outcome::status_result<CommitOutcome>  resolve_outcome(uint64_t our_ts, uint64_t our_id,
-                                                                          std::optional<uint16_t> group_count);
     outcome::status_result<void>           write_block(byteview bytes);
     void refresh_from_watcher() noexcept;
 
-    struct IndexedValue { uint64_t ts_counter; uint64_t file_offset; };
+    struct LogicalBlockId {
+        uint64_t hi;
+        uint64_t lo;
+
+        bool operator==(const LogicalBlockId& other) const noexcept {
+            return hi == other.hi && lo == other.lo;
+        }
+    };
+    struct LogicalBlockIdHash {
+        std::size_t operator()(const LogicalBlockId& id) const noexcept {
+            const auto hi_hash = std::hash<uint64_t>{}(id.hi);
+            const auto lo_hash = std::hash<uint64_t>{}(id.lo);
+            return hi_hash ^ (lo_hash + 0x9e3779b97f4a7c15ull + (hi_hash << 6U) + (hi_hash >> 2U));
+        }
+    };
+    struct IndexedValue { LogicalBlockId id; uint64_t file_offset; uint16_t entry_index; };
     struct KeyHash {
         using is_transparent = void;
         std::size_t operator()(std::string_view s) const noexcept;
@@ -322,10 +336,10 @@ private:
     outcome::status_result<void>                    refresh_index();
     outcome::status_result<bool> group_is_complete(byteview mapped, uint64_t file_offset, const DecodedBlock& first_block);
     outcome::status_result<void> index_block(byteview mapped, uint64_t file_offset, const DecodedBlock& blk);
-    outcome::status_result<LogRecordView>           record_view_at(uint64_t file_offset);
+    outcome::status_result<LogRecordView>           record_view_at(uint64_t file_offset, uint16_t entry_index);
     outcome::status_result<byteview> mapped_bytes();
     outcome::status_result<byteview> current_mapped_bytes() const;
-    void maybe_index_value(uint64_t file_offset, uint64_t ts_counter,
+    void maybe_index_value(uint64_t file_offset, uint16_t entry_index, LogicalBlockId id,
                            std::string_view key);
 
     std::string path_;
@@ -334,11 +348,9 @@ private:
     mutable std::mutex mutex_;
     std::mt19937_64    rng_;
     uint64_t  scanned_through_offset_ = 0;
-    uint64_t  latest_ts_              = 0;
     KeyArena  key_arena_;
-    std::unordered_map<uint64_t, uint64_t> first_random_id_by_ts_;
+    std::unordered_set<LogicalBlockId, LogicalBlockIdHash> indexed_logical_blocks_;
     std::unordered_map<std::string_view, IndexedValue, KeyHash, KeyEqual> latest_by_key_;
-    std::vector<bool> group_match_scratch_;
     std::unique_ptr<FileWatcher> watcher_;
 };
 

@@ -4,7 +4,7 @@
 
 namespace borinkdb::detail {
 
-std::size_t ts_byte_length(uint64_t v) noexcept {
+std::size_t varuint_byte_length(uint64_t v) noexcept {
     std::size_t n = 1;
     for (uint64_t x = v >> 8; x != 0; x >>= 8) {
         ++n;
@@ -32,7 +32,7 @@ void write_u64_le(std::byte*& dst, uint64_t v) noexcept {
     dst += 8;
 }
 
-void write_ts_le(std::byte*& dst, uint64_t v, std::size_t byte_count) noexcept {
+void write_varuint_le(std::byte*& dst, uint64_t v, std::size_t byte_count) noexcept {
     for (std::size_t i = 0; i < byte_count; ++i) {
         dst[i] = static_cast<std::byte>((v >> (8 * i)) & 0xFFu);
     }
@@ -80,7 +80,7 @@ uint64_t read_u64_le(const std::byte*& src) noexcept {
     return v;
 }
 
-uint64_t read_ts_le(const std::byte*& src, std::size_t byte_count) noexcept {
+uint64_t read_varuint_le(const std::byte*& src, std::size_t byte_count) noexcept {
     uint64_t v = 0;
     for (std::size_t i = 0; i < byte_count; ++i) {
         v |= static_cast<uint64_t>(static_cast<uint8_t>(src[i])) << (8 * i);

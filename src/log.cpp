@@ -12,22 +12,21 @@ namespace borinkdb::log::file {
 
 constexpr std::size_t kMagicSize = kBlockMagic.size();
 constexpr std::size_t kTotalLenSize = 2;
-constexpr std::size_t kKindSize = 1;
+constexpr std::size_t kReservedSize = 1;
 constexpr std::size_t kFlagsSize = 1;
-constexpr std::size_t kTsLenSize = 1;
-constexpr std::size_t kRandomIdSize = 8;
+constexpr std::size_t kIdHiLenSize = 1;
+constexpr std::size_t kIdLoSize = 8;
 constexpr std::size_t kGroupFieldsSize = 4;
+constexpr std::size_t kEntryCountSize = 2;
 constexpr std::size_t kKeyLenSize = 2;
 constexpr std::size_t kMetaLenSize = 2;
 constexpr std::size_t kPayloadLenSize = 2;
 constexpr std::size_t kCrcSize = 4;
-constexpr std::size_t kMaxTsLen = 8;
-constexpr std::size_t kFixedHeaderPrefix =
-    kMagicSize + kTotalLenSize + kKindSize + kFlagsSize + kTsLenSize;
+constexpr std::size_t kMaxIdHiLen = 8;
+constexpr std::size_t kEntryHeaderSize = kKeyLenSize + kMetaLenSize + kPayloadLenSize;
 
-constexpr bool kind_is_known(uint8_t raw) noexcept {
-    return raw >= static_cast<uint8_t>(BlockKind::Wait) && raw <= static_cast<uint8_t>(BlockKind::Group);
-}
+constexpr std::size_t kFixedHeaderPrefix =
+    kMagicSize + kTotalLenSize + kReservedSize + kFlagsSize + kIdHiLenSize;
 
 // Returns the first possible block boundary at or after start, or bytes.size()
 // if none exists. Callers use this to resynchronize after corrupt bytes.
@@ -43,10 +42,6 @@ std::size_t find_magic(byteview bytes, std::size_t start) {
     return bytes.size();
 }
 
-bool is_grouped(BlockKind k) noexcept {
-    return k == BlockKind::Group;
-}
-
 bool is_truncated_block_error(const outcome::status_result<DecodedBlock>& decoded) noexcept {
     return decoded.error().equivalent(system_error2::make_status_code(Error::truncated_block));
 }
@@ -54,84 +49,10 @@ bool is_truncated_block_error(const outcome::status_result<DecodedBlock>& decode
 bool is_recoverable_block_error(const outcome::status_result<DecodedBlock>& decoded) noexcept {
     return decoded.error().equivalent(system_error2::make_status_code(Error::invalid_magic)) ||
            decoded.error().equivalent(system_error2::make_status_code(Error::invalid_block_length)) ||
-           decoded.error().equivalent(system_error2::make_status_code(Error::invalid_block_kind)) ||
-           decoded.error().equivalent(system_error2::make_status_code(Error::invalid_timestamp_length)) ||
+           decoded.error().equivalent(system_error2::make_status_code(Error::invalid_id_length)) ||
            decoded.error().equivalent(system_error2::make_status_code(Error::malformed_block)) ||
            decoded.error().equivalent(system_error2::make_status_code(Error::checksum_mismatch));
 }
-
-struct CommitScanState {
-    uint64_t our_ts;
-    uint64_t our_id;
-    std::optional<uint16_t> group_count;
-    std::vector<bool>& matched_group_blocks;
-    bool found_our_ts = false;
-    CommitOutcome outcome = CommitOutcome::Lost;
-    uint16_t matched_group_count = 0;
-
-    void observe(uint64_t offset, const DecodedBlock& blk) {
-        (void) offset;
-        if (!found_our_ts) {
-            observe_first_candidate(blk);
-            return;
-        }
-        observe_group_continuation(blk);
-    }
-
-private:
-    void observe_first_candidate(const DecodedBlock& blk) {
-        if (blk.ts_counter != our_ts) {
-            return;
-        }
-
-        found_our_ts = true;
-        if (blk.random_id != our_id) {
-            outcome = CommitOutcome::Lost;
-            return;
-        }
-        if (!group_count.has_value()) {
-            outcome = CommitOutcome::Success;
-            return;
-        }
-        if (blk.kind == BlockKind::Group &&
-            blk.group &&
-            blk.group->index == 0 &&
-            blk.group->count == *group_count) {
-            matched_group_blocks.assign(*group_count, false);
-            matched_group_blocks[0] = true;
-            matched_group_count = 1;
-            outcome = (*group_count == 1) ? CommitOutcome::Success : CommitOutcome::Lost;
-        }
-    }
-
-    void observe_group_continuation(const DecodedBlock& blk) {
-        if (!group_count ||
-            outcome != CommitOutcome::Lost ||
-            matched_group_count == 0 ||
-            matched_group_count >= *group_count) {
-            return;
-        }
-
-        if (blk.ts_counter != our_ts ||
-            blk.random_id != our_id ||
-            blk.kind != BlockKind::Group ||
-            !blk.group ||
-            blk.group->count != *group_count) {
-            return;
-        }
-
-        if (blk.group->index >= matched_group_blocks.size()) {
-            return;
-        }
-        if (!matched_group_blocks[blk.group->index]) {
-            matched_group_blocks[blk.group->index] = true;
-            ++matched_group_count;
-        }
-        if (matched_group_count == *group_count) {
-            outcome = CommitOutcome::Success;
-        }
-    }
-};
 
 outcome::status_result<byteview> mapped_bytes(llfio::mapped_file_handle& mapped_h) {
     OUTCOME_TRY(auto extent, mapped_h.update_map());
@@ -145,10 +66,14 @@ outcome::status_result<byteview> mapped_bytes(llfio::mapped_file_handle& mapped_
     return byteview{p, static_cast<std::size_t>(extent)};
 }
 
-LogRecordView::LogRecordView(uint64_t counter,
+LogRecordView::LogRecordView(uint64_t id_hi,
+                             uint64_t id_lo,
+                             uint16_t group_index,
                              byteview meta_bytes,
                              PayloadBlockList payload_blocks)
-    : counter_(counter),
+    : id_hi_(id_hi),
+      id_lo_(id_lo),
+      group_index_(group_index),
       meta_bytes_(meta_bytes),
       payload_blocks_(std::move(payload_blocks)) {}
 
@@ -184,73 +109,76 @@ std::span<const byteview> PayloadBlockList::view() const noexcept {
 }
 
 outcome::status_result<std::vector<std::byte>> encode_block(const EncodeRequest& req) {
-    if (!kind_is_known(static_cast<uint8_t>(req.kind))) {
-        return Error::invalid_block_kind;
-    }
-    const bool grouped = is_grouped(req.kind);
-    if (grouped && !req.group.has_value()) {
-        return Error::missing_group_info;
-    }
-    if (!grouped && req.group.has_value()) {
-        return Error::unexpected_group_info;
-    }
-    if (grouped && (req.group->count == 0 || req.group->index >= req.group->count)) {
+    if (req.group.count == 0 || req.group.index >= req.group.count) {
         return Error::invalid_group_info;
     }
-    if (req.key.size() > 0xFFFFu) {
-        return Error::key_too_large;
-    }
-    if (req.meta_bytes.size() > 0xFFFFu) {
-        return Error::metadata_too_large;
-    }
-    if (req.payload_bytes.size() > 0xFFFFu) {
-        return Error::payload_too_large;
+
+    const BlockEntry single_entry{
+        .key = req.key,
+        .meta_bytes = req.meta_bytes,
+        .payload_bytes = req.payload_bytes,
+    };
+    const auto entries = req.entries.empty()
+                             ? std::span<const BlockEntry>{&single_entry, 1}
+                             : req.entries;
+    if (entries.size() > 0xFFFFu) {
+        return Error::too_many_group_blocks;
     }
 
-    const std::size_t ts_len = detail::ts_byte_length(req.ts_counter);
-    const std::size_t group_extra = grouped ? kGroupFieldsSize : 0;
+    const std::size_t id_hi_len = detail::varuint_byte_length(req.id_hi);
     const std::size_t total =
-        kFixedHeaderPrefix + ts_len + kRandomIdSize + group_extra +
-        kKeyLenSize + req.key.size() +
-        kMetaLenSize + req.meta_bytes.size() +
-        kPayloadLenSize + req.payload_bytes.size() +
+        kFixedHeaderPrefix + id_hi_len + kIdLoSize + kGroupFieldsSize + kEntryCountSize +
         kCrcSize;
-    if (total >= kMaxBlockBytes) {
+    std::size_t entries_size = 0;
+    for (const auto& entry : entries) {
+        if (entry.key.size() > 0xFFFFu) {
+            return Error::key_too_large;
+        }
+        if (entry.meta_bytes.size() > 0xFFFFu) {
+            return Error::metadata_too_large;
+        }
+        if (entry.payload_bytes.size() > 0xFFFFu) {
+            return Error::payload_too_large;
+        }
+        entries_size += kEntryHeaderSize + entry.key.size() + entry.meta_bytes.size() + entry.payload_bytes.size();
+    }
+    const std::size_t block_total = total + entries_size;
+    if (block_total >= kMaxBlockBytes) {
         return Error::block_too_large;
     }
 
-    std::vector<std::byte> out(total);
+    std::vector<std::byte> out(block_total);
     std::byte* p = out.data();
 
     detail::write_bytes(p, kBlockMagic.data(), kMagicSize);
-    detail::write_u16_le(p, static_cast<uint16_t>(total));
-    *p++ = static_cast<std::byte>(req.kind);
+    detail::write_u16_le(p, static_cast<uint16_t>(block_total));
     *p++ = std::byte{0};
-    *p++ = static_cast<std::byte>(ts_len);
-    detail::write_ts_le(p, req.ts_counter, ts_len);
-    detail::write_u64_le(p, req.random_id);
+    *p++ = std::byte{0};
+    *p++ = static_cast<std::byte>(id_hi_len);
+    detail::write_varuint_le(p, req.id_hi, id_hi_len);
+    detail::write_u64_le(p, req.id_lo);
+    detail::write_u16_le(p, req.group.index);
+    detail::write_u16_le(p, req.group.count);
 
-    if (grouped) {
-        detail::write_u16_le(p, req.group->index);
-        detail::write_u16_le(p, req.group->count);
+    detail::write_u16_le(p, static_cast<uint16_t>(entries.size()));
+    for (const auto& entry : entries) {
+        detail::write_u16_le(p, static_cast<uint16_t>(entry.key.size()));
+        detail::write_bytes(p, entry.key);
+
+        detail::write_u16_le(p, static_cast<uint16_t>(entry.meta_bytes.size()));
+        detail::write_bytes(p, entry.meta_bytes);
+
+        detail::write_u16_le(p, static_cast<uint16_t>(entry.payload_bytes.size()));
+        detail::write_bytes(p, entry.payload_bytes);
     }
 
-    detail::write_u16_le(p, static_cast<uint16_t>(req.key.size()));
-    detail::write_bytes(p, req.key);
-
-    detail::write_u16_le(p, static_cast<uint16_t>(req.meta_bytes.size()));
-    detail::write_bytes(p, req.meta_bytes);
-
-    detail::write_u16_le(p, static_cast<uint16_t>(req.payload_bytes.size()));
-    detail::write_bytes(p, req.payload_bytes);
-
-    detail::write_u32_le(p, crc32c({out.data(), total - kCrcSize}));
+    detail::write_u32_le(p, crc32c({out.data(), block_total - kCrcSize}));
     return out;
 }
 
-outcome::status_result<DecodedBlock> decode_block(byteview input) noexcept {
+outcome::status_result<DecodedBlock> decode_block(byteview input) {
     constexpr std::size_t min_size =
-        kFixedHeaderPrefix + 1 + kRandomIdSize + kKeyLenSize + kMetaLenSize + kPayloadLenSize + kCrcSize;
+        kFixedHeaderPrefix + 1 + kIdLoSize + kGroupFieldsSize + kEntryCountSize + kEntryHeaderSize + kCrcSize;
     if (input.size() < min_size) {
         return Error::truncated_block;
     }
@@ -267,59 +195,71 @@ outcome::status_result<DecodedBlock> decode_block(byteview input) noexcept {
         return Error::truncated_block;
     }
 
-    const uint8_t kind_raw = static_cast<uint8_t>(input[kMagicSize + kTotalLenSize]);
-    if (!kind_is_known(kind_raw)) {
-        return Error::invalid_block_kind;
-    }
-    const auto kind = static_cast<BlockKind>(kind_raw);
-
-    const uint8_t ts_len = static_cast<uint8_t>(input[kMagicSize + kTotalLenSize + kKindSize + kFlagsSize]);
-    if (ts_len < 1 || ts_len > kMaxTsLen) {
-        return Error::invalid_timestamp_length;
+    const uint8_t id_hi_len = static_cast<uint8_t>(input[kMagicSize + kTotalLenSize + kReservedSize + kFlagsSize]);
+    if (id_hi_len < 1 || id_hi_len > kMaxIdHiLen) {
+        return Error::invalid_id_length;
     }
 
     const std::byte* p = input.data() + kFixedHeaderPrefix;
     const std::byte* const end_excl_crc = input.data() + (total_len - kCrcSize);
-    const std::size_t group_extra = is_grouped(kind) ? kGroupFieldsSize : 0;
     const std::size_t fixed_body =
-        ts_len + kRandomIdSize + group_extra + kKeyLenSize + kMetaLenSize + kPayloadLenSize;
+        id_hi_len + kIdLoSize + kGroupFieldsSize + kEntryCountSize;
     if (p + fixed_body > end_excl_crc) {
         return Error::malformed_block;
     }
 
-    const uint64_t ts_counter = detail::read_ts_le(p, ts_len);
-    const uint64_t random_id = detail::read_u64_le(p);
+    const uint64_t id_hi = detail::read_varuint_le(p, id_hi_len);
+    const uint64_t id_lo = detail::read_u64_le(p);
 
-    std::optional<GroupInfo> group;
-    if (is_grouped(kind)) {
-        GroupInfo gi;
-        gi.index = detail::read_u16_le(p);
-        gi.count = detail::read_u16_le(p);
-        if (gi.count == 0 || gi.index >= gi.count) {
+    GroupInfo group;
+    group.index = detail::read_u16_le(p);
+    group.count = detail::read_u16_le(p);
+    if (group.count == 0 || group.index >= group.count) {
+        return Error::malformed_block;
+    }
+
+    const uint16_t entry_count = detail::read_u16_le(p);
+    if (entry_count == 0) {
+        return Error::malformed_block;
+    }
+
+    std::vector<DecodedEntry> entries;
+    entries.reserve(entry_count);
+    for (uint16_t i = 0; i < entry_count; ++i) {
+        if (p + kEntryHeaderSize > end_excl_crc) {
             return Error::malformed_block;
         }
-        group = gi;
-    }
 
-    const uint16_t key_len = detail::read_u16_le(p);
-    if (p + key_len > end_excl_crc) {
+        const uint16_t key_len = detail::read_u16_le(p);
+        if (p + key_len > end_excl_crc) {
+            return Error::malformed_block;
+        }
+        std::string_view key{reinterpret_cast<const char*>(p), key_len};
+        p += key_len;
+
+        const uint16_t meta_len = detail::read_u16_le(p);
+        if (p + meta_len > end_excl_crc) {
+            return Error::malformed_block;
+        }
+        byteview meta_bytes{p, meta_len};
+        p += meta_len;
+
+        const uint16_t payload_len = detail::read_u16_le(p);
+        if (p + payload_len > end_excl_crc) {
+            return Error::malformed_block;
+        }
+        byteview payload_bytes{p, payload_len};
+        p += payload_len;
+
+        entries.push_back(DecodedEntry{
+            .key = key,
+            .meta_bytes = meta_bytes,
+            .payload_bytes = payload_bytes,
+        });
+    }
+    if (p != end_excl_crc) {
         return Error::malformed_block;
     }
-    std::string_view key{reinterpret_cast<const char*>(p), key_len};
-    p += key_len;
-
-    const uint16_t meta_len = detail::read_u16_le(p);
-    if (p + meta_len > end_excl_crc) {
-        return Error::malformed_block;
-    }
-    byteview meta_bytes{p, meta_len};
-    p += meta_len;
-
-    const uint16_t payload_len = detail::read_u16_le(p);
-    if (p + payload_len != end_excl_crc) {
-        return Error::malformed_block;
-    }
-    byteview payload_bytes{p, payload_len};
 
     const std::byte* expected_crc_p = input.data() + (total_len - kCrcSize);
     const uint32_t expected_crc = detail::read_u32_le(expected_crc_p);
@@ -329,13 +269,13 @@ outcome::status_result<DecodedBlock> decode_block(byteview input) noexcept {
     }
 
     return DecodedBlock{
-        .kind = kind,
-        .ts_counter = ts_counter,
-        .random_id = random_id,
+        .id_hi = id_hi,
+        .id_lo = id_lo,
         .group = group,
-        .key = key,
-        .meta_bytes = meta_bytes,
-        .payload_bytes = payload_bytes,
+        .key = entries.front().key,
+        .meta_bytes = entries.front().meta_bytes,
+        .payload_bytes = entries.front().payload_bytes,
+        .entries = std::move(entries),
         .total_size = total_len,
     };
 }
@@ -488,33 +428,6 @@ outcome::status_result<void> LogFile::ensure_append_handle() {
     return outcome::success();
 }
 
-outcome::status_result<CommitOutcome> LogFile::resolve_outcome(uint64_t our_ts,
-                                                        uint64_t our_id,
-                                                        std::optional<uint16_t> group_count) {
-    OUTCOME_TRY(auto mapped, borinkdb::log::file::mapped_bytes(mapped_h_));
-    const uint64_t end = mapped.size();
-    if (end <= scanned_through_offset_) {
-        return CommitOutcome::Lost;
-    }
-
-    group_match_scratch_.clear();
-    CommitScanState state{
-        .our_ts = our_ts,
-        .our_id = our_id,
-        .group_count = group_count,
-        .matched_group_blocks = group_match_scratch_,
-    };
-    auto scan_result = scan_range(mapped, scanned_through_offset_, end,
-                                  [&](uint64_t offset, const DecodedBlock& blk) {
-                                      state.observe(offset, blk);
-                                      latest_ts_ = std::max(latest_ts_, blk.ts_counter);
-                                  });
-    if (!scan_result) {
-        return std::move(scan_result).as_failure();
-    }
-    return state.found_our_ts ? state.outcome : CommitOutcome::Lost;
-}
-
 outcome::status_result<void> LogFile::write_block(byteview bytes) {
     OUTCOME_TRYV(ensure_append_handle());
     llfio::file_handle::const_buffer_type write_buffer{bytes.data(), bytes.size()};
@@ -531,88 +444,112 @@ outcome::status_result<void> LogFile::write_block(byteview bytes) {
     return outcome::success();
 }
 
-outcome::status_result<CommitResult> LogFile::commit_wait() {
+outcome::status_result<CommitResult> LogFile::commit_transaction(std::span<const TransactionEntry> entries) {
     std::lock_guard lock(mutex_);
-    OUTCOME_TRYV(refresh_index());
-    const uint64_t our_ts = latest_ts_ + 1;
-    const uint64_t our_id = rng_();
-    const byteview empty;
-    OUTCOME_TRY(auto encoded, encode_block({
-        .kind = BlockKind::Wait,
-        .ts_counter = our_ts,
-        .random_id = our_id,
-        .group = std::nullopt,
-        .key = {},
-        .meta_bytes = empty,
-        .payload_bytes = empty,
-    }));
-    OUTCOME_TRYV(write_block(encoded));
-    OUTCOME_TRY(auto commit_outcome, resolve_outcome(our_ts, our_id, std::nullopt));
-    OUTCOME_TRYV(refresh_index());
-    return CommitResult{.outcome = commit_outcome, .ts_counter = our_ts, .random_id = our_id};
-}
-
-outcome::status_result<CommitResult> LogFile::commit_payload(
-    std::string_view key,
-    byteview meta_bytes,
-    byteview payload_bytes) {
-    std::lock_guard lock(mutex_);
-    OUTCOME_TRYV(refresh_index());
-    const uint64_t our_ts = latest_ts_ + 1;
-    const uint64_t our_id = rng_();
-
-    auto single_probe = encode_block({
-        .kind = BlockKind::Group,
-        .ts_counter = our_ts,
-        .random_id = our_id,
-        .group = GroupInfo{.index = 0, .count = 1},
-        .key = key,
-        .meta_bytes = meta_bytes,
-        .payload_bytes = payload_bytes,
-    });
-
-    if (single_probe) {
-        OUTCOME_TRYV(write_block(single_probe.value()));
-        OUTCOME_TRY(auto commit_outcome, resolve_outcome(our_ts, our_id, 1));
-        OUTCOME_TRYV(refresh_index());
-        return CommitResult{.outcome = commit_outcome, .ts_counter = our_ts, .random_id = our_id};
+    if (entries.empty()) {
+        return Error::bad_argument;
     }
 
-    const bool should_group =
-        single_probe.error().equivalent(system_error2::make_status_code(Error::block_too_large)) ||
-        single_probe.error().equivalent(system_error2::make_status_code(Error::payload_too_large));
-    if (!should_group) {
-        return std::move(single_probe).as_failure();
-    }
+    OUTCOME_TRYV(refresh_index());
+    const uint64_t our_id_hi = rng_();
+    const uint64_t our_id_lo = rng_();
 
-    const std::size_t count_sz = (payload_bytes.size() + kGroupPayloadChunkBytes - 1) / kGroupPayloadChunkBytes;
-    if (count_sz == 0) {
-        return Error::payload_too_large;
+    std::vector<std::vector<BlockEntry>> blocks;
+    std::vector<BlockEntry> current_block;
+    auto flush_current = [&] {
+        if (!current_block.empty()) {
+            blocks.push_back(std::move(current_block));
+            current_block = {};
+        }
+    };
+    auto fits_current_block = [&](const BlockEntry& entry) -> outcome::status_result<bool> {
+        auto candidate = current_block;
+        candidate.push_back(entry);
+        auto encoded = encode_block({
+            .id_hi = our_id_hi,
+            .id_lo = our_id_lo,
+            .group = GroupInfo{.index = 0, .count = 1},
+            .key = {},
+            .meta_bytes = {},
+            .payload_bytes = {},
+            .entries = candidate,
+        });
+        if (encoded) {
+            return true;
+        }
+        if (encoded.error().equivalent(system_error2::make_status_code(Error::block_too_large))) {
+            return false;
+        }
+        return std::move(encoded).as_failure();
+    };
+    auto add_packable_entry = [&](BlockEntry entry) -> outcome::status_result<void> {
+        OUTCOME_TRY(auto fits, fits_current_block(entry));
+        if (!fits) {
+            flush_current();
+            OUTCOME_TRY(auto fits_empty, fits_current_block(entry));
+            if (!fits_empty) {
+                return Error::block_too_large;
+            }
+        }
+        current_block.push_back(entry);
+        return outcome::success();
+    };
+
+    for (const auto& entry : entries) {
+        const std::size_t chunks =
+            std::max<std::size_t>(1, (entry.payload_bytes.size() + kGroupPayloadChunkBytes - 1) / kGroupPayloadChunkBytes);
+        if (chunks > kMaxGroupBlocks || blocks.size() > kMaxGroupBlocks - chunks) {
+            return Error::too_many_group_blocks;
+        }
+        if (chunks == 1) {
+            OUTCOME_TRYV(add_packable_entry(BlockEntry{
+                .key = entry.key,
+                .meta_bytes = entry.meta_bytes,
+                .payload_bytes = entry.payload_bytes,
+            }));
+            continue;
+        }
+
+        flush_current();
+        for (std::size_t chunk = 0; chunk < chunks; ++chunk) {
+            const std::size_t begin = chunk * kGroupPayloadChunkBytes;
+            const std::size_t n = entry.payload_bytes.empty()
+                                      ? 0
+                                      : std::min(kGroupPayloadChunkBytes, entry.payload_bytes.size() - begin);
+            BlockEntry block_entry{
+                .key = chunk == 0 ? entry.key : std::string_view{},
+                .meta_bytes = chunk == 0 ? entry.meta_bytes : byteview{},
+                .payload_bytes = entry.payload_bytes.subspan(begin, n),
+            };
+            OUTCOME_TRY(auto fits_single, fits_current_block(block_entry));
+            if (!fits_single) {
+                return Error::block_too_large;
+            }
+            blocks.push_back(std::vector<BlockEntry>{block_entry});
+        }
     }
-    if (count_sz > kMaxGroupBlocks) {
+    flush_current();
+
+    if (blocks.empty() || blocks.size() > kMaxGroupBlocks) {
         return Error::too_many_group_blocks;
     }
-    const auto count = static_cast<uint16_t>(count_sz);
+    const auto count = static_cast<uint16_t>(blocks.size());
 
-    for (uint16_t i = 0; i < count; ++i) {
-        const std::size_t begin = static_cast<std::size_t>(i) * kGroupPayloadChunkBytes;
-        const std::size_t n = std::min(kGroupPayloadChunkBytes, payload_bytes.size() - begin);
-        const auto block_key = i == 0 ? key : std::string_view{};
-        const auto meta = i == 0 ? meta_bytes : byteview{};
+    for (uint16_t index = 0; index < count; ++index) {
         OUTCOME_TRY(auto encoded, encode_block({
-            .kind = BlockKind::Group,
-            .ts_counter = our_ts,
-            .random_id = our_id,
-            .group = GroupInfo{.index = i, .count = count},
-            .key = block_key,
-            .meta_bytes = meta,
-            .payload_bytes = payload_bytes.subspan(begin, n),
+            .id_hi = our_id_hi,
+            .id_lo = our_id_lo,
+            .group = GroupInfo{.index = index, .count = count},
+            .key = {},
+            .meta_bytes = {},
+            .payload_bytes = {},
+            .entries = blocks[index],
         }));
         OUTCOME_TRYV(write_block(encoded));
     }
-    OUTCOME_TRY(auto commit_outcome, resolve_outcome(our_ts, our_id, count));
+
     OUTCOME_TRYV(refresh_index());
-    return CommitResult{.outcome = commit_outcome, .ts_counter = our_ts, .random_id = our_id};
+    return CommitResult{.id_hi = our_id_hi, .id_lo = our_id_lo};
 }
 
 std::size_t LogFile::KeyHash::operator()(std::string_view s) const noexcept {
@@ -640,24 +577,25 @@ std::string_view LogFile::KeyArena::store(std::string_view key) {
 }
 
 void LogFile::maybe_index_value(uint64_t file_offset,
-                                  uint64_t ts_counter,
-                                  std::string_view key) {
+                                uint16_t entry_index,
+                                LogicalBlockId id,
+                                std::string_view key) {
     if (key.empty()) {
         return;
     }
     auto it = latest_by_key_.find(key);
     if (it != latest_by_key_.end()) {
-        if (ts_counter >= it->second.ts_counter) {
-            it->second.ts_counter = ts_counter;
-            it->second.file_offset = file_offset;
-        }
+        it->second.id = id;
+        it->second.file_offset = file_offset;
+        it->second.entry_index = entry_index;
         return;
     }
 
     const std::string_view stored_key = key_arena_.store(key);
     latest_by_key_.emplace(stored_key, IndexedValue{
-        .ts_counter = ts_counter,
+        .id = id,
         .file_offset = file_offset,
+        .entry_index = entry_index,
     });
 }
 
@@ -680,16 +618,14 @@ outcome::status_result<byteview> LogFile::current_mapped_bytes() const {
 outcome::status_result<bool> LogFile::group_is_complete(byteview mapped,
                                                         uint64_t file_offset,
                                                         const DecodedBlock& first_block) {
-    if (first_block.kind != BlockKind::Group ||
-        !first_block.group ||
-        first_block.group->index != 0) {
+    if (first_block.group.index != 0) {
         return false;
     }
-    if (first_block.group->count == 1) {
+    if (first_block.group.count == 1) {
         return true;
     }
 
-    std::vector<bool> seen(first_block.group->count, false);
+    std::vector<bool> seen(first_block.group.count, false);
     seen[0] = true;
     uint16_t seen_count = 1;
     OUTCOME_TRYV(scan_range(
@@ -697,36 +633,67 @@ outcome::status_result<bool> LogFile::group_is_complete(byteview mapped,
         file_offset + first_block.total_size,
         mapped.size(),
         [&](uint64_t, const DecodedBlock& block) {
-            if (seen_count == first_block.group->count) {
+            if (seen_count == first_block.group.count) {
                 return;
             }
-        if (block.ts_counter == first_block.ts_counter &&
-            block.random_id == first_block.random_id &&
-            block.kind == BlockKind::Group &&
-            block.group &&
-            block.group->count == first_block.group->count &&
-            !seen[block.group->index]) {
-            seen[block.group->index] = true;
-            ++seen_count;
-        }
+            if (block.id_hi == first_block.id_hi &&
+                block.id_lo == first_block.id_lo &&
+                block.group.count == first_block.group.count &&
+                !seen[block.group.index]) {
+                seen[block.group.index] = true;
+                ++seen_count;
+            }
         }));
-    return seen_count == first_block.group->count;
+    return seen_count == first_block.group.count;
 }
 
 outcome::status_result<void> LogFile::index_block(byteview mapped, uint64_t file_offset, const DecodedBlock& blk) {
-    auto [first_it, inserted] = first_random_id_by_ts_.emplace(blk.ts_counter, blk.random_id);
-    (void) inserted;
-    latest_ts_ = std::max(latest_ts_, blk.ts_counter);
+    if (blk.group.index != 0) {
+        return outcome::success();
+    }
 
-    if (first_it->second == blk.random_id &&
-        blk.kind == BlockKind::Group &&
-        blk.group &&
-        blk.group->index == 0) {
-        OUTCOME_TRY(auto complete, group_is_complete(mapped, file_offset, blk));
-        if (complete) {
-            maybe_index_value(file_offset, blk.ts_counter, blk.key);
+    OUTCOME_TRY(auto complete, group_is_complete(mapped, file_offset, blk));
+    if (!complete) {
+        return outcome::success();
+    }
+
+    const LogicalBlockId id{.hi = blk.id_hi, .lo = blk.id_lo};
+    auto [_, inserted] = indexed_logical_blocks_.insert(id);
+    if (!inserted) {
+        return outcome::success();
+    }
+    for (uint16_t i = 0; i < blk.entries.size(); ++i) {
+        if (!blk.entries[i].key.empty()) {
+            maybe_index_value(file_offset, i, id, blk.entries[i].key);
         }
     }
+    std::vector<bool> seen(blk.group.count, false);
+    seen[0] = true;
+    uint16_t seen_count = 1;
+    OUTCOME_TRYV(scan_range(
+        mapped,
+        file_offset + blk.total_size,
+        mapped.size(),
+        [&](uint64_t offset, const DecodedBlock& block) {
+            if (seen_count == blk.group.count) {
+                return;
+            }
+            if (block.id_hi != blk.id_hi ||
+                block.id_lo != blk.id_lo ||
+                block.group.count != blk.group.count ||
+                seen[block.group.index]) {
+                return;
+            }
+
+            seen[block.group.index] = true;
+            ++seen_count;
+            for (uint16_t i = 0; i < block.entries.size(); ++i) {
+                if (!block.entries[i].key.empty()) {
+                    maybe_index_value(offset, i, id, block.entries[i].key);
+                }
+            }
+        }
+    ));
     return outcome::success();
 }
 
@@ -771,21 +738,28 @@ outcome::status_result<void> LogFile::visit_records(const RecordVisitor& visit) 
         0,
         mapped.size(),
         [&](uint64_t offset, const DecodedBlock& blk) {
-            if (!visit_result || blk.kind != BlockKind::Group || !blk.group || blk.group->index != 0 || blk.key.empty()) {
+            if (!visit_result) {
                 return;
             }
 
-            auto record = record_view_at(offset);
-            if (!record) {
-                visit_result = std::move(record).as_failure();
-                return;
+            for (uint16_t i = 0; i < blk.entries.size(); ++i) {
+                const auto& entry = blk.entries[i];
+                if (entry.key.empty()) {
+                    continue;
+                }
+
+                auto record = record_view_at(offset, i);
+                if (!record) {
+                    visit_result = std::move(record).as_failure();
+                    return;
+                }
+                visit(entry.key, record.value());
             }
-            visit(blk.key, record.value());
         }));
     return visit_result;
 }
 
-outcome::status_result<LogRecordView> LogFile::record_view_at(uint64_t file_offset) {
+outcome::status_result<LogRecordView> LogFile::record_view_at(uint64_t file_offset, uint16_t entry_index) {
     OUTCOME_TRY(auto mapped, current_mapped_bytes());
     if (file_offset >= mapped.size()) {
         return Error::invalid_file_offset;
@@ -793,46 +767,43 @@ outcome::status_result<LogRecordView> LogFile::record_view_at(uint64_t file_offs
 
     const auto offset = static_cast<std::size_t>(file_offset);
     OUTCOME_TRY(auto first_block, decode_block(mapped.subspan(offset)));
-    if (first_block.kind != BlockKind::Group || !first_block.group || first_block.group->index != 0) {
+    if (entry_index >= first_block.entries.size()) {
+        return Error::corrupt_group;
+    }
+    const auto& first_entry = first_block.entries[entry_index];
+    if (first_entry.key.empty()) {
         return Error::corrupt_group;
     }
 
     PayloadBlockList payload_blocks;
-    payload_blocks.reserve(first_block.group->count);
+    payload_blocks.reserve(first_block.group.count);
+    payload_blocks.push_back(first_entry.payload_bytes);
 
-    std::vector<byteview> blocks(first_block.group->count);
-    std::vector<bool> seen(first_block.group->count, false);
-    blocks[0] = first_block.payload_bytes;
-    seen[0] = true;
-    uint16_t seen_count = 1;
+    uint16_t next_index = static_cast<uint16_t>(first_block.group.index + 1);
 
     OUTCOME_TRYV(scan_range(
         mapped,
         file_offset + first_block.total_size,
         mapped.size(),
         [&](uint64_t, const DecodedBlock& block) {
-            if (seen_count == first_block.group->count) {
+            if (next_index >= first_block.group.count) {
                 return;
             }
-            if (block.kind == BlockKind::Group &&
-                block.group &&
-                block.group->count == first_block.group->count &&
-                block.ts_counter == first_block.ts_counter &&
-                block.random_id == first_block.random_id &&
-                !seen[block.group->index]) {
-                blocks[block.group->index] = block.payload_bytes;
-                seen[block.group->index] = true;
-                ++seen_count;
+            if (block.id_hi != first_block.id_hi ||
+                block.id_lo != first_block.id_lo ||
+                block.group.count != first_block.group.count) {
+                return;
+            }
+            if (block.entries.size() != 1 || !block.entries.front().key.empty()) {
+                return;
+            }
+            if (block.group.index == next_index) {
+                payload_blocks.push_back(block.entries.front().payload_bytes);
+                ++next_index;
             }
         }));
 
-    if (seen_count != first_block.group->count) {
-        return Error::corrupt_group;
-    }
-    for (const auto block : blocks) {
-        payload_blocks.push_back(block);
-    }
-    return LogRecordView(first_block.ts_counter, first_block.meta_bytes, std::move(payload_blocks));
+    return LogRecordView(first_block.id_hi, first_block.id_lo, first_block.group.index, first_entry.meta_bytes, std::move(payload_blocks));
 }
 
 outcome::status_result<std::optional<LogRecordView>> LogFile::get_record_view(std::string_view key, LogReadMode mode) {
@@ -844,13 +815,8 @@ outcome::status_result<std::optional<LogRecordView>> LogFile::get_record_view(st
     if (it == latest_by_key_.end()) {
         return std::optional<LogRecordView>{};
     }
-    OUTCOME_TRY(auto record, record_view_at(it->second.file_offset));
+    OUTCOME_TRY(auto record, record_view_at(it->second.file_offset, it->second.entry_index));
     return std::optional<LogRecordView>{std::move(record)};
-}
-
-uint64_t LogFile::latest_counter() const {
-    std::lock_guard lock(mutex_);
-    return latest_ts_;
 }
 
 uint64_t LogFile::scanned_through() const {

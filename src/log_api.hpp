@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <outcome/experimental/status_result.hpp>
@@ -23,13 +25,17 @@ namespace bytelog {
 namespace outcome = OUTCOME_V2_NAMESPACE::experimental;
 using byteview = std::span<const std::byte>;
 
-enum class ReadOptions {
-    Refresh,
-    UseCached,
+struct LogicalBlockId {
+    uint64_t hi = 0;
+    uint64_t lo = 0;
+
+    bool operator==(const LogicalBlockId& other) const noexcept {
+        return hi == other.hi && lo == other.lo;
+    }
 };
 
 struct RecordView {
-    uint64_t counter = 0;
+    LogicalBlockId id;
     byteview meta;
     std::vector<byteview> payload_blocks;
 };
@@ -41,24 +47,38 @@ enum class PutOutcome {
 
 struct PutResult {
     PutOutcome outcome = PutOutcome::Retry;
-    uint64_t counter = 0;
+    LogicalBlockId id;
+};
+
+class TransactionContext {
+public:
+    virtual ~TransactionContext() = default;
+
+    virtual outcome::status_result<std::optional<RecordView>> get(std::string_view key) = 0;
+    virtual outcome::status_result<void> put_if(std::string_view key, byteview meta, byteview payload) = 0;
+    virtual outcome::status_result<void> overwrite(std::string_view key, byteview meta, byteview payload) = 0;
+};
+
+using TransactionFunction = std::function<outcome::status_result<void>(TransactionContext&)>;
+
+class TxHandle {
+public:
+    virtual ~TxHandle() = default;
+    virtual outcome::status_result<PutResult> wait() = 0;
 };
 
 class Log {
 public:
     virtual ~Log() = default;
 
-    // Append one logical value. Success means fresh reads should return this
-    // value until a higher counter for the same key is committed. Retry means
-    // another writer won the current counter race; callers should try again.
-    virtual outcome::status_result<PutResult> put(std::string_view key, byteview meta, byteview payload) = 0;
+    // Return the current cached/indexed value. This is intentionally a cache
+    // read; callers that need to force external visibility should call refresh.
+    virtual outcome::status_result<std::optional<RecordView>> get(std::string_view key) = 0;
 
-    // Refresh the backend's view of storage as needed and return the latest
-    // committed value for key. Returned spans are borrowed from the backend and
-    // stay valid while the Log is alive. Payload is exposed as block spans;
-    // callers can copy if they need one contiguous buffer.
-    virtual outcome::status_result<std::optional<RecordView>>
-        get_latest(std::string_view key, ReadOptions options = ReadOptions::Refresh) = 0;
+    // Queue a side-effect-free transaction for this log's worker thread. The
+    // returned handle resolves once the transaction's batch has been written and
+    // this transaction's individual success/retry result is known.
+    virtual outcome::status_result<std::unique_ptr<TxHandle>> tx(TransactionFunction fn) = 0;
 
     // Bring this instance's read-side cache/index forward without requiring a
     // lookup. For PostgreSQL this can be driven by LISTEN/NOTIFY; for the file
@@ -77,9 +97,8 @@ public:
     FileLog(const FileLog&) = delete;
     FileLog& operator=(const FileLog&) = delete;
 
-    outcome::status_result<PutResult> put(std::string_view key, byteview meta, byteview payload) override;
-    outcome::status_result<std::optional<RecordView>>
-        get_latest(std::string_view key, ReadOptions options = ReadOptions::Refresh) override;
+    outcome::status_result<std::optional<RecordView>> get(std::string_view key) override;
+    outcome::status_result<std::unique_ptr<TxHandle>> tx(TransactionFunction fn) override;
     outcome::status_result<void> refresh() override;
 
 private:

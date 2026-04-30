@@ -12,13 +12,16 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <random>
 #include <span>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include <llfio/llfio.hpp>
@@ -54,10 +57,12 @@ struct Scenario {
     std::size_t processes;
     std::size_t threads_per_process;
     uint64_t target_per_writer_per_second;
+    bool doc_workload = false;
 };
 
 struct Stats {
     uint64_t logical_successes = 0;
+    uint64_t logical_key_writes = 0;
     uint64_t attempts = 0;
     uint64_t retries = 0;
     uint64_t errors = 0;
@@ -66,6 +71,12 @@ struct Stats {
     uint64_t extra_physical_records = 0;
     uint64_t missing = 0;
     uint64_t corrupt = 0;
+    uint64_t incomplete_transactions = 0;
+    uint64_t physical_blocks = 0;
+    uint64_t logical_blocks = 0;
+    uint64_t transaction_block_refs = 0;
+    uint64_t max_transactions_per_block = 0;
+    uint64_t max_keys_per_block = 0;
     uint64_t latency_ns_total = 0;
     uint64_t latency_ns_max = 0;
     uint64_t retries_per_success_max = 0;
@@ -79,6 +90,7 @@ std::vector<std::byte> bytes(std::string_view s) {
 
 void add_stats(Stats& dst, const Stats& src) {
     dst.logical_successes += src.logical_successes;
+    dst.logical_key_writes += src.logical_key_writes;
     dst.attempts += src.attempts;
     dst.retries += src.retries;
     dst.errors += src.errors;
@@ -87,6 +99,12 @@ void add_stats(Stats& dst, const Stats& src) {
     dst.extra_physical_records += src.extra_physical_records;
     dst.missing += src.missing;
     dst.corrupt += src.corrupt;
+    dst.incomplete_transactions += src.incomplete_transactions;
+    dst.physical_blocks += src.physical_blocks;
+    dst.logical_blocks += src.logical_blocks;
+    dst.transaction_block_refs += src.transaction_block_refs;
+    dst.max_transactions_per_block = std::max(dst.max_transactions_per_block, src.max_transactions_per_block);
+    dst.max_keys_per_block = std::max(dst.max_keys_per_block, src.max_keys_per_block);
     dst.latency_ns_total += src.latency_ns_total;
     dst.latency_ns_max = std::max(dst.latency_ns_max, src.latency_ns_max);
     dst.retries_per_success_max = std::max(dst.retries_per_success_max, src.retries_per_success_max);
@@ -109,6 +127,46 @@ std::string bench_key(std::size_t process_index, std::size_t thread_index, uint6
 
 std::string bench_count_key(std::size_t process_index, std::size_t thread_index) {
     return "bench-count-" + std::to_string(process_index) + "-" + std::to_string(thread_index);
+}
+
+std::string doc_count_key(std::size_t process_index) {
+    return "doc-count-" + std::to_string(process_index);
+}
+
+std::string doc_key(std::size_t key_index) {
+    return "doc-key-" + std::to_string(key_index);
+}
+
+std::string doc_tx_id(std::size_t process_index, uint64_t sequence) {
+    return std::to_string(process_index) + ":" + std::to_string(sequence);
+}
+
+std::size_t choose_doc_key(std::mt19937_64& rng) {
+    std::uniform_int_distribution<int> hotness{0, 99};
+    const int bucket = hotness(rng);
+    if (bucket < 30) {
+        std::uniform_int_distribution<std::size_t> dist{0, 999};
+        return dist(rng);
+    }
+    if (bucket < 80) {
+        std::uniform_int_distribution<std::size_t> dist{1000, 9999};
+        return dist(rng);
+    }
+    std::uniform_int_distribution<std::size_t> dist{10000, 99999};
+    return dist(rng);
+}
+
+std::size_t choose_doc_transaction_key_count(std::mt19937_64& rng) {
+    std::uniform_int_distribution<int> one_key{0, 99};
+    if (one_key(rng) < 80) {
+        return 1;
+    }
+
+    // The non-single-key tail is intentionally simple and bounded. It gives the
+    // benchmark multi-key transactions without making rare huge transactions
+    // dominate every short run.
+    std::uniform_int_distribution<std::size_t> dist{2, 20};
+    return dist(rng);
 }
 
 bool bytes_equal(byteview a, byteview b) {
@@ -195,7 +253,15 @@ Stats run_thread_worker(std::string_view path,
         uint64_t retries_for_write = 0;
         for (;;) {
             ++stats.attempts;
-            auto put = opened.value()->put(key, meta, payload);
+            auto handle = opened.value()->tx([&](bytelog::TransactionContext& tx) -> outcome::status_result<void> {
+                OUTCOME_TRYV(tx.overwrite(key, meta, payload));
+                return outcome::success();
+            });
+            if (!handle) {
+                ++stats.errors;
+                break;
+            }
+            auto put = handle.value()->wait();
             if (!put) {
                 ++stats.errors;
                 break;
@@ -231,7 +297,15 @@ Stats run_thread_worker(std::string_view path,
     const auto count_payload = bytes(std::to_string(sequence));
     const auto count_key = bench_count_key(process_index, thread_index);
     for (int attempt = 0; attempt < 100; ++attempt) {
-        auto put = opened.value()->put(count_key, byteview{}, count_payload);
+        auto handle = opened.value()->tx([&](bytelog::TransactionContext& tx) -> outcome::status_result<void> {
+            OUTCOME_TRYV(tx.overwrite(count_key, byteview{}, count_payload));
+            return outcome::success();
+        });
+        if (!handle) {
+            ++stats.errors;
+            break;
+        }
+        auto put = handle.value()->wait();
         if (!put) {
             ++stats.errors;
             break;
@@ -242,6 +316,145 @@ Stats run_thread_worker(std::string_view path,
         std::this_thread::yield();
     }
 
+    return stats;
+}
+
+Stats run_doc_process_worker(std::string_view path,
+                             std::size_t process_index,
+                             std::chrono::milliseconds duration,
+                             const Options& options) {
+    Stats stats;
+    auto opened = bytelog::FileLog::open(path);
+    if (!opened) {
+        stats.errors = 1;
+        return stats;
+    }
+
+    constexpr std::size_t kUpdatesPerBatch = 25;
+    constexpr auto kBatchInterval = std::chrono::seconds{1};
+    const auto end_time = Clock::now() + duration;
+    auto next_batch = Clock::now();
+    uint64_t sequence = 0;
+    std::mt19937_64 rng{
+        static_cast<uint64_t>(process_index + 1) * 0x9E3779B97F4A7C15ull ^
+        static_cast<uint64_t>(duration.count())};
+    std::mt19937_64 jitter_rng{
+        static_cast<uint64_t>(process_index + 17) * 0xD1B54A32D192ED03ull};
+    std::uniform_int_distribution<uint64_t> jitter_dist{0, options.retry_jitter_us};
+
+    struct PendingUpdate {
+        std::vector<std::size_t> keys;
+        std::vector<std::byte> payload;
+        std::string meta_prefix;
+        Clock::time_point started;
+        uint64_t retries = 0;
+    };
+
+    auto submit_update = [&](const PendingUpdate& update) {
+        return opened.value()->tx([update](bytelog::TransactionContext& tx) -> outcome::status_result<void> {
+            for (const auto key_index : update.keys) {
+                OUTCOME_TRY(auto ignored, tx.get(doc_key(key_index)));
+                (void) ignored;
+            }
+            for (std::size_t i = 0; i < update.keys.size(); ++i) {
+                const auto meta = bytes(update.meta_prefix + std::to_string(i) + ":" + std::to_string(update.keys.size()));
+                OUTCOME_TRYV(tx.put_if(doc_key(update.keys[i]), meta, update.payload));
+            }
+            return outcome::success();
+        });
+    };
+
+    while (Clock::now() < end_time) {
+        next_batch += kBatchInterval;
+
+        std::vector<std::unique_ptr<bytelog::TxHandle>> handles;
+        handles.reserve(kUpdatesPerBatch);
+        std::vector<PendingUpdate> pending;
+        pending.reserve(kUpdatesPerBatch);
+
+        for (std::size_t update_index = 0; update_index < kUpdatesPerBatch; ++update_index) {
+            if (Clock::now() >= end_time) {
+                break;
+            }
+
+            std::set<std::size_t> unique_keys;
+            const auto desired_key_count = choose_doc_transaction_key_count(rng);
+            while (unique_keys.size() < desired_key_count) {
+                unique_keys.insert(choose_doc_key(rng));
+            }
+            const auto tx_id = doc_tx_id(process_index, sequence++);
+            pending.push_back(PendingUpdate{
+                .keys = {unique_keys.begin(), unique_keys.end()},
+                .payload = bytes("doc-payload:" + tx_id),
+                .meta_prefix = "doc-tx:" + tx_id + ":",
+                .started = Clock::now(),
+            });
+
+            auto handle = submit_update(pending.back());
+            if (!handle) {
+                ++stats.errors;
+                pending.pop_back();
+                continue;
+            }
+            handles.push_back(std::move(handle.value()));
+        }
+
+        for (std::size_t i = 0; i < handles.size(); ++i) {
+            for (;;) {
+                ++stats.attempts;
+                auto put = handles[i]->wait();
+                if (!put) {
+                    ++stats.errors;
+                    break;
+                }
+                if (put.value().outcome == bytelog::PutOutcome::Success) {
+                    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - pending[i].started);
+                    const auto ns = static_cast<uint64_t>(elapsed.count());
+                    ++stats.logical_successes;
+                    stats.logical_key_writes += pending[i].keys.size();
+                    record_retries_per_success(stats, pending[i].retries);
+                    stats.latency_ns_total += ns;
+                    stats.latency_ns_max = std::max(stats.latency_ns_max, ns);
+                    break;
+                }
+
+                ++stats.retries;
+                ++pending[i].retries;
+                const uint64_t delay_us = options.retry_backoff_us +
+                                          (options.retry_jitter_us == 0 ? 0 : jitter_dist(jitter_rng));
+                if (delay_us == 0) {
+                    std::this_thread::yield();
+                } else {
+                    std::this_thread::sleep_for(std::chrono::microseconds{static_cast<long long>(delay_us)});
+                }
+
+                // Resubmit the same deterministic update after a normal OCC
+                // retry. The transaction callback itself remains side-effect
+                // free; only this outer harness counts attempts.
+                if (Clock::now() >= end_time) {
+                    break;
+                }
+                auto retry_handle = submit_update(pending[i]);
+                if (!retry_handle) {
+                    ++stats.errors;
+                    break;
+                }
+                handles[i] = std::move(retry_handle.value());
+            }
+        }
+
+        std::this_thread::sleep_until(next_batch);
+    }
+
+    const auto count_payload = bytes(std::to_string(stats.logical_successes) + ":" + std::to_string(stats.logical_key_writes));
+    const auto count_key = doc_count_key(process_index);
+    auto handle = opened.value()->tx([&](bytelog::TransactionContext& tx) -> outcome::status_result<void> {
+        OUTCOME_TRYV(tx.overwrite(count_key, byteview{}, count_payload));
+        return outcome::success();
+    });
+    if (!handle || !handle.value()->wait()) {
+        ++stats.errors;
+    }
     return stats;
 }
 
@@ -295,6 +508,12 @@ struct WorkerVerification {
     std::vector<uint64_t> sequences;
 };
 
+struct DocMeta {
+    std::string tx_id;
+    std::size_t key_index = 0;
+    std::size_t key_count = 0;
+};
+
 std::optional<ParsedBenchKey> parse_bench_key(std::string_view key) {
     constexpr std::string_view prefix = "bench-";
     if (key.rfind(prefix, 0) != 0 || key.rfind("bench-count-", 0) == 0) {
@@ -345,6 +564,66 @@ std::optional<ParsedCountKey> parse_count_key(std::string_view key) {
         .process_index = static_cast<std::size_t>(*process),
         .thread_index = static_cast<std::size_t>(*thread),
     };
+}
+
+std::optional<std::size_t> parse_doc_count_key(std::string_view key) {
+    constexpr std::string_view prefix = "doc-count-";
+    if (key.rfind(prefix, 0) != 0) {
+        return std::nullopt;
+    }
+    auto parsed = parse_u64(key.substr(prefix.size()));
+    if (!parsed) {
+        return std::nullopt;
+    }
+    return static_cast<std::size_t>(*parsed);
+}
+
+std::optional<DocMeta> parse_doc_meta(byteview bytes) {
+    const std::string_view text{reinterpret_cast<const char*>(bytes.data()), bytes.size()};
+    constexpr std::string_view prefix = "doc-tx:";
+    if (text.rfind(prefix, 0) != 0) {
+        return std::nullopt;
+    }
+
+    auto rest = text.substr(prefix.size());
+    const auto first = rest.find(':');
+    if (first == std::string_view::npos) {
+        return std::nullopt;
+    }
+    const auto second = rest.find(':', first + 1);
+    if (second == std::string_view::npos) {
+        return std::nullopt;
+    }
+    const auto third = rest.find(':', second + 1);
+    if (third == std::string_view::npos) {
+        return std::nullopt;
+    }
+
+    const auto tx_id = std::string{rest.substr(0, second)};
+    const auto key_index = parse_u64(rest.substr(second + 1, third - second - 1));
+    const auto key_count = parse_u64(rest.substr(third + 1));
+    if (!key_index || !key_count || *key_count == 0 || *key_index >= *key_count) {
+        return std::nullopt;
+    }
+    return DocMeta{
+        .tx_id = tx_id,
+        .key_index = static_cast<std::size_t>(*key_index),
+        .key_count = static_cast<std::size_t>(*key_count),
+    };
+}
+
+std::optional<std::pair<uint64_t, uint64_t>> parse_doc_marker(byteview bytes) {
+    const std::string_view text{reinterpret_cast<const char*>(bytes.data()), bytes.size()};
+    const auto colon = text.find(':');
+    if (colon == std::string_view::npos) {
+        return std::nullopt;
+    }
+    const auto successes = parse_u64(text.substr(0, colon));
+    const auto key_writes = parse_u64(text.substr(colon + 1));
+    if (!successes || !key_writes) {
+        return std::nullopt;
+    }
+    return std::pair{*successes, *key_writes};
 }
 
 outcome::status_result<Stats> verify_scenario(std::string_view path, const Scenario& scenario) {
@@ -435,6 +714,116 @@ outcome::status_result<Stats> verify_scenario(std::string_view path, const Scena
     return verification;
 }
 
+outcome::status_result<Stats> verify_doc_scenario(std::string_view path, const Scenario& scenario) {
+    OUTCOME_TRY(auto reader, filelog::LogFile::open(path));
+
+    struct SeenTransaction {
+        std::size_t expected_key_count = 0;
+        std::set<std::size_t> seen_key_indexes;
+        bool corrupt = false;
+    };
+    struct SeenBlock {
+        uint64_t key_records = 0;
+        std::set<std::string> transaction_ids;
+    };
+
+    Stats verification;
+    std::vector<bool> marker_seen(scenario.processes, false);
+    uint64_t marker_successes = 0;
+    uint64_t marker_key_writes = 0;
+    std::map<std::string, SeenTransaction> transactions;
+    std::map<std::tuple<uint64_t, uint64_t, uint16_t>, SeenBlock> blocks;
+    std::set<std::pair<uint64_t, uint64_t>> logical_blocks;
+
+    OUTCOME_TRYV(reader->visit_records([&](std::string_view key, const filelog::LogRecordView& record) {
+        if (const auto process_index = parse_doc_count_key(key)) {
+            if (*process_index >= scenario.processes || record.payload_blocks().size() != 1) {
+                ++verification.corrupt;
+                return;
+            }
+            const auto marker = parse_doc_marker(record.payload_blocks().front());
+            if (!marker) {
+                ++verification.corrupt;
+                return;
+            }
+            marker_seen[*process_index] = true;
+            marker_successes += marker->first;
+            marker_key_writes += marker->second;
+            return;
+        }
+
+        constexpr std::string_view key_prefix = "doc-key-";
+        if (key.rfind(key_prefix, 0) != 0) {
+            return;
+        }
+
+        const auto meta = parse_doc_meta(record.meta_bytes());
+        if (!meta) {
+            ++verification.corrupt;
+            return;
+        }
+        const auto expected_payload = bytes("doc-payload:" + meta->tx_id);
+        if (!bytes_equal_blocks(record.payload_blocks(), expected_payload)) {
+            ++verification.corrupt;
+            return;
+        }
+
+        auto& tx = transactions[meta->tx_id];
+        if (tx.expected_key_count == 0) {
+            tx.expected_key_count = meta->key_count;
+        } else if (tx.expected_key_count != meta->key_count) {
+            tx.corrupt = true;
+        }
+        if (!tx.seen_key_indexes.insert(meta->key_index).second) {
+            tx.corrupt = true;
+        }
+        auto& block = blocks[{record.id_hi(), record.id_lo(), record.group_index()}];
+        ++block.key_records;
+        block.transaction_ids.insert(meta->tx_id);
+        logical_blocks.insert({record.id_hi(), record.id_lo()});
+        ++verification.verified;
+    }));
+
+    for (bool seen : marker_seen) {
+        if (!seen) {
+            ++verification.missing;
+        }
+    }
+
+    verification.verification_candidates = marker_key_writes;
+    if (transactions.size() < marker_successes) {
+        verification.missing += marker_successes - transactions.size();
+    } else if (transactions.size() > marker_successes) {
+        verification.extra_physical_records += transactions.size() - marker_successes;
+    }
+
+    for (const auto& [_, tx] : transactions) {
+        if (tx.corrupt) {
+            ++verification.corrupt;
+        }
+        if (tx.seen_key_indexes.size() != tx.expected_key_count) {
+            ++verification.incomplete_transactions;
+            if (tx.seen_key_indexes.size() < tx.expected_key_count) {
+                verification.missing += tx.expected_key_count - tx.seen_key_indexes.size();
+            } else {
+                verification.extra_physical_records += tx.seen_key_indexes.size() - tx.expected_key_count;
+            }
+        }
+    }
+
+    verification.physical_blocks = blocks.size();
+    verification.logical_blocks = logical_blocks.size();
+    for (const auto& [_, block] : blocks) {
+        verification.transaction_block_refs += block.transaction_ids.size();
+        verification.max_transactions_per_block =
+            std::max<uint64_t>(verification.max_transactions_per_block, block.transaction_ids.size());
+        verification.max_keys_per_block =
+            std::max<uint64_t>(verification.max_keys_per_block, block.key_records);
+    }
+
+    return verification;
+}
+
 #if !defined(_WIN32)
 bool write_all(int fd, const void* data, std::size_t size) {
     const auto* p = static_cast<const char*>(data);
@@ -474,13 +863,15 @@ outcome::status_result<Stats> run_scenario(const Scenario& scenario, const Optio
         OUTCOME_TRYV(unlink_path(path));
         return filelog::Error::bad_argument;
     }
-    auto stats = run_process_workers(
-        path,
-        0,
-        scenario.threads_per_process,
-        options.duration,
-        scenario.target_per_writer_per_second,
-        options);
+    auto stats = scenario.doc_workload
+                     ? run_doc_process_worker(path, 0, options.duration, options)
+                     : run_process_workers(
+                           path,
+                           0,
+                           scenario.threads_per_process,
+                           options.duration,
+                           scenario.target_per_writer_per_second,
+                           options);
 #else
     Stats stats;
     std::vector<pid_t> children;
@@ -504,13 +895,15 @@ outcome::status_result<Stats> run_scenario(const Scenario& scenario, const Optio
         }
         if (pid == 0) {
             close(fds[0]);
-            const auto child_stats = run_process_workers(
-                path,
-                process_index,
-                scenario.threads_per_process,
-                options.duration,
-                scenario.target_per_writer_per_second,
-                options);
+            const auto child_stats = scenario.doc_workload
+                                         ? run_doc_process_worker(path, process_index, options.duration, options)
+                                         : run_process_workers(
+                                               path,
+                                               process_index,
+                                               scenario.threads_per_process,
+                                               options.duration,
+                                               scenario.target_per_writer_per_second,
+                                               options);
             const bool wrote = write_all(fds[1], &child_stats, sizeof(child_stats));
             close(fds[1]);
             std::_Exit(wrote ? 0 : 1);
@@ -539,12 +932,20 @@ outcome::status_result<Stats> run_scenario(const Scenario& scenario, const Optio
     }
 #endif
 
-    OUTCOME_TRY(auto verification, verify_scenario(path, scenario));
+    OUTCOME_TRY(auto verification, scenario.doc_workload
+                                       ? verify_doc_scenario(path, scenario)
+                                       : verify_scenario(path, scenario));
     stats.verified = verification.verified;
     stats.verification_candidates = verification.verification_candidates;
     stats.extra_physical_records = verification.extra_physical_records;
     stats.missing = verification.missing;
     stats.corrupt = verification.corrupt;
+    stats.incomplete_transactions = verification.incomplete_transactions;
+    stats.physical_blocks = verification.physical_blocks;
+    stats.logical_blocks = verification.logical_blocks;
+    stats.transaction_block_refs = verification.transaction_block_refs;
+    stats.max_transactions_per_block = verification.max_transactions_per_block;
+    stats.max_keys_per_block = verification.max_keys_per_block;
 
     OUTCOME_TRYV(unlink_path(path));
     return stats;
@@ -573,6 +974,7 @@ void print_result(const Scenario& scenario, const Options& options, const Stats&
     const auto writers = scenario.processes * scenario.threads_per_process;
     const auto duration_seconds = static_cast<double>(options.duration.count()) / 1000.0;
     const auto successes_per_second = as_double(stats.logical_successes) / duration_seconds;
+    const auto key_writes_per_second = as_double(stats.logical_key_writes) / duration_seconds;
     const auto attempts_per_second = as_double(stats.attempts) / duration_seconds;
     const auto retry_percent =
         stats.attempts == 0 ? 0.0 : (as_double(stats.retries) * 100.0 / as_double(stats.attempts));
@@ -583,6 +985,14 @@ void print_result(const Scenario& scenario, const Options& options, const Stats&
     const auto avg_latency_us =
         stats.logical_successes == 0 ? 0.0 : as_double(stats.latency_ns_total) / as_double(stats.logical_successes) / 1000.0;
     const auto max_latency_us = as_double(stats.latency_ns_max) / 1000.0;
+    const auto avg_keys_per_tx =
+        stats.logical_successes == 0 ? 0.0 : as_double(stats.logical_key_writes) / as_double(stats.logical_successes);
+    const auto avg_keys_per_block =
+        stats.physical_blocks == 0 ? 0.0 : as_double(stats.verified) / as_double(stats.physical_blocks);
+    const auto avg_tx_per_block =
+        stats.physical_blocks == 0 ? 0.0 : as_double(stats.transaction_block_refs) / as_double(stats.physical_blocks);
+    const auto avg_physical_blocks_per_logical =
+        stats.logical_blocks == 0 ? 0.0 : as_double(stats.physical_blocks) / as_double(stats.logical_blocks);
 
     std::cout
         << std::left << std::setw(28) << scenario.name
@@ -591,6 +1001,8 @@ void print_result(const Scenario& scenario, const Options& options, const Stats&
         << " writers=" << writers
         << " target/writer/s=" << scenario.target_per_writer_per_second
         << " successful_writes/s=" << std::fixed << std::setprecision(1) << successes_per_second
+        << " key_writes/s=" << key_writes_per_second
+        << " avg_keys/tx=" << avg_keys_per_tx
         << " attempts/s=" << attempts_per_second
         << " retries=" << stats.retries
         << " retry%=" << retry_percent
@@ -600,10 +1012,18 @@ void print_result(const Scenario& scenario, const Options& options, const Stats&
         << " max_retries/success=" << stats.retries_per_success_max
         << " avg_us=" << avg_latency_us
         << " max_us=" << max_latency_us
+        << " physical_blocks=" << stats.physical_blocks
+        << " logical_blocks=" << stats.logical_blocks
+        << " avg_physical/logical=" << avg_physical_blocks_per_logical
+        << " avg_keys/block=" << avg_keys_per_block
+        << " avg_tx/block=" << avg_tx_per_block
+        << " max_keys/block=" << stats.max_keys_per_block
+        << " max_tx/block=" << stats.max_transactions_per_block
         << " verified=" << stats.verified << "/" << stats.verification_candidates
         << " extra_physical=" << stats.extra_physical_records
         << " missing=" << stats.missing
         << " corrupt=" << stats.corrupt
+        << " incomplete_tx=" << stats.incomplete_transactions
         << " errors=" << stats.errors
         << '\n';
 }
@@ -659,6 +1079,12 @@ Options parse_options(int argc, char** argv) {
 }
 
 std::vector<Scenario> scenarios_for(const Options& options) {
+    if (options.scenario_set == "doc" || options.scenario_set == "contention") {
+        return {
+            Scenario{"doc 8 proc 25 tx/s", 8, 1, 25, true},
+        };
+    }
+
     if (options.scenario_set == "5000") {
         return {
             Scenario{"1 proc 1 thread 5000/s", 1, 1, 5000},
