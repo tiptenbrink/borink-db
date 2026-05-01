@@ -345,6 +345,7 @@ struct PendingTransaction {
     std::size_t writer_index = 0;
     uint64_t logical_sequence = 0;
     Clock::time_point started{};
+    Clock::time_point next_attempt_at{};
     std::vector<std::size_t> key_indexes;
     std::optional<filelog::CommitResult> in_flight;
     uint64_t retries = 0;
@@ -409,6 +410,7 @@ void enqueue_new_transactions(ProposalWriter& writer,
             .writer_index = writer_index,
             .logical_sequence = writer.next_logical_sequence++,
             .started = now,
+            .next_attempt_at = now,
             .key_indexes = choose_transaction_keys(writer.rng),
             .in_flight = std::nullopt,
             .retries = 0,
@@ -419,6 +421,7 @@ void enqueue_new_transactions(ProposalWriter& writer,
 outcome::status_result<void> append_ready_proposals(ProposalWriter& writer,
                                                     std::size_t writer_index,
                                                     uint64_t observed_version,
+                                                    Clock::time_point now,
                                                     Stats& stats) {
     std::vector<filelog::TransactionEntry> records;
     std::vector<std::string> keys;
@@ -428,7 +431,7 @@ outcome::status_result<void> append_ready_proposals(ProposalWriter& writer,
     payloads.reserve(writer.pending.size());
 
     for (auto& tx : writer.pending) {
-        if (tx.in_flight.has_value()) {
+        if (tx.in_flight.has_value() || tx.next_attempt_at > now) {
             continue;
         }
         tx.in_flight = next_proposal_id(writer, writer_index);
@@ -449,9 +452,30 @@ outcome::status_result<void> append_ready_proposals(ProposalWriter& writer,
     return outcome::success();
 }
 
+Clock::duration retry_delay(const Options& options, uint64_t retries, std::mt19937_64& rng) {
+    constexpr uint64_t kMaxDelayUs = 500000;
+    uint64_t delay_us = 0;
+    if (options.retry_backoff_us != 0) {
+        const auto shift = static_cast<unsigned>(std::min<uint64_t>(retries == 0 ? 0 : retries - 1, 20));
+        delay_us = options.retry_backoff_us;
+        if (delay_us <= (std::numeric_limits<uint64_t>::max() >> shift)) {
+            delay_us <<= shift;
+        } else {
+            delay_us = kMaxDelayUs;
+        }
+        delay_us = std::min<uint64_t>(delay_us, kMaxDelayUs);
+    }
+    if (options.retry_jitter_us != 0) {
+        std::uniform_int_distribution<uint64_t> jitter{0, options.retry_jitter_us};
+        delay_us = std::min<uint64_t>(delay_us + jitter(rng), kMaxDelayUs);
+    }
+    return std::chrono::microseconds{static_cast<long long>(delay_us)};
+}
+
 void apply_proposal_results(ProposalWriter& writer,
                             const CanonicalSnapshot& snapshot,
                             Clock::time_point now,
+                            const Options& options,
                             Stats& stats) {
     for (auto it = writer.pending.begin(); it != writer.pending.end();) {
         if (!it->in_flight.has_value()) {
@@ -474,6 +498,7 @@ void apply_proposal_results(ProposalWriter& writer,
             ++stats.retries;
             ++it->retries;
             it->in_flight = std::nullopt;
+            it->next_attempt_at = now + retry_delay(options, it->retries, writer.rng);
             ++it;
         }
     }
@@ -483,6 +508,21 @@ bool has_pending_transactions(const std::vector<ProposalWriter>& writers) {
     return std::any_of(writers.begin(), writers.end(), [](const ProposalWriter& writer) {
         return !writer.pending.empty();
     });
+}
+
+std::optional<Clock::time_point> next_retry_time(const std::vector<ProposalWriter>& writers) {
+    std::optional<Clock::time_point> next;
+    for (const auto& writer : writers) {
+        for (const auto& tx : writer.pending) {
+            if (tx.in_flight.has_value()) {
+                continue;
+            }
+            if (!next.has_value() || tx.next_attempt_at < *next) {
+                next = tx.next_attempt_at;
+            }
+        }
+    }
+    return next;
 }
 
 outcome::status_result<Stats> run_scenario(const Scenario& scenario, const Options& options) {
@@ -516,28 +556,40 @@ outcome::status_result<Stats> run_scenario(const Scenario& scenario, const Optio
         std::max<uint64_t>(1, scenario.target_per_writer_per_second));
 
     while (Clock::now() < end_time || has_pending_transactions(writers)) {
-        const auto generating = Clock::now() < end_time;
-        if (generating) {
-            next_batch += std::chrono::seconds{1};
-            const auto now = Clock::now();
+        const auto now = Clock::now();
+        const auto generating = now < end_time;
+        if (generating && now >= next_batch) {
             for (std::size_t writer_index = 0; writer_index < writers.size(); ++writer_index) {
                 enqueue_new_transactions(writers[writer_index], writer_index, per_writer_batch, now);
+            }
+            next_batch += std::chrono::seconds{1};
+            while (next_batch <= now) {
+                next_batch += std::chrono::seconds{1};
             }
         }
 
         for (std::size_t writer_index = 0; writer_index < writers.size(); ++writer_index) {
-            OUTCOME_TRYV(append_ready_proposals(writers[writer_index], writer_index, observed_version, stats));
+            OUTCOME_TRYV(append_ready_proposals(writers[writer_index], writer_index, observed_version, now, stats));
         }
         OUTCOME_TRYV(borinkdb::coordinator::run_epoch_once(root, epoch, 1000000, true));
         OUTCOME_TRY(auto snapshot, scan_canonical(canonical_path.string()));
         observed_version = snapshot.version;
-        const auto now = Clock::now();
+        const auto after_commit = Clock::now();
         for (auto& writer : writers) {
-            apply_proposal_results(writer, snapshot, now, stats);
+            apply_proposal_results(writer, snapshot, after_commit, options, stats);
         }
 
-        if (generating) {
-            std::this_thread::sleep_until(next_batch);
+        std::optional<Clock::time_point> wake_at;
+        if (Clock::now() < end_time) {
+            wake_at = next_batch;
+        }
+        if (const auto retry_at = next_retry_time(writers)) {
+            if (!wake_at.has_value() || *retry_at < *wake_at) {
+                wake_at = *retry_at;
+            }
+        }
+        if (wake_at.has_value() && *wake_at > Clock::now()) {
+            std::this_thread::sleep_until(*wake_at);
         }
     }
 
