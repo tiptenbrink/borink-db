@@ -1,19 +1,18 @@
 #include "bench.hpp"
 
 #include "log.hpp"
-#include "log_api.hpp"
-
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
-#include <mutex>
 #include <optional>
 #include <set>
 #include <random>
@@ -22,27 +21,32 @@
 #include <string_view>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
-#include <llfio/llfio.hpp>
 #include <outcome/experimental/status-code/include/status-code/iostream_support.hpp>
 #include <outcome/try.hpp>
+#include <rfl/msgpack.hpp>
 
-#if !defined(_WIN32)
-#include <sys/wait.h>
-#include <unistd.h>
-#endif
+namespace borinkdb::coordinator {
+namespace outcome = OUTCOME_V2_NAMESPACE::experimental;
+outcome::status_result<void> run_epoch_once(std::filesystem::path root,
+                                            std::string epoch,
+                                            std::size_t batch_limit,
+                                            bool quiet);
+}
 
 namespace borinkdb::bench {
 namespace {
 
-namespace bytelog = borinkdb::bytelog;
 namespace filelog = borinkdb::log::file;
-namespace llfio = LLFIO_V2_NAMESPACE;
 namespace outcome = OUTCOME_V2_NAMESPACE::experimental;
 using Clock = std::chrono::steady_clock;
 using byteview = std::span<const std::byte>;
 constexpr std::size_t kRetryHistogramBuckets = 256;
+constexpr std::string_view kProposalKeyPrefix = "__borinkdb/proposal/";
+constexpr std::string_view kFailedKey = "__borinkdb/tx/failed";
 
 struct Options {
     std::chrono::milliseconds duration{1000};
@@ -57,7 +61,6 @@ struct Scenario {
     std::size_t processes;
     std::size_t threads_per_process;
     uint64_t target_per_writer_per_second;
-    bool doc_workload = false;
 };
 
 struct Stats {
@@ -81,6 +84,8 @@ struct Stats {
     uint64_t latency_ns_max = 0;
     uint64_t retries_per_success_max = 0;
     std::array<uint64_t, kRetryHistogramBuckets> retries_per_success_hist{};
+    std::vector<uint64_t> completed_retries;
+    std::vector<uint64_t> completed_latency_ns;
 };
 
 std::vector<std::byte> bytes(std::string_view s) {
@@ -88,49 +93,16 @@ std::vector<std::byte> bytes(std::string_view s) {
     return {view.begin(), view.end()};
 }
 
-void add_stats(Stats& dst, const Stats& src) {
-    dst.logical_successes += src.logical_successes;
-    dst.logical_key_writes += src.logical_key_writes;
-    dst.attempts += src.attempts;
-    dst.retries += src.retries;
-    dst.errors += src.errors;
-    dst.verified += src.verified;
-    dst.verification_candidates += src.verification_candidates;
-    dst.extra_physical_records += src.extra_physical_records;
-    dst.missing += src.missing;
-    dst.corrupt += src.corrupt;
-    dst.incomplete_transactions += src.incomplete_transactions;
-    dst.physical_blocks += src.physical_blocks;
-    dst.logical_blocks += src.logical_blocks;
-    dst.transaction_block_refs += src.transaction_block_refs;
-    dst.max_transactions_per_block = std::max(dst.max_transactions_per_block, src.max_transactions_per_block);
-    dst.max_keys_per_block = std::max(dst.max_keys_per_block, src.max_keys_per_block);
-    dst.latency_ns_total += src.latency_ns_total;
-    dst.latency_ns_max = std::max(dst.latency_ns_max, src.latency_ns_max);
-    dst.retries_per_success_max = std::max(dst.retries_per_success_max, src.retries_per_success_max);
-    for (std::size_t i = 0; i < dst.retries_per_success_hist.size(); ++i) {
-        dst.retries_per_success_hist[i] += src.retries_per_success_hist[i];
-    }
-}
-
-void record_retries_per_success(Stats& stats, uint64_t retries_for_write) {
+void record_completed_transaction(Stats& stats, uint64_t retries_for_write, uint64_t latency_ns) {
+    ++stats.logical_successes;
     stats.retries_per_success_max = std::max(stats.retries_per_success_max, retries_for_write);
     const auto bucket = static_cast<std::size_t>(
         std::min<uint64_t>(retries_for_write, kRetryHistogramBuckets - 1));
     ++stats.retries_per_success_hist[bucket];
-}
-
-std::string bench_key(std::size_t process_index, std::size_t thread_index, uint64_t sequence) {
-    return "bench-" + std::to_string(process_index) + "-" +
-           std::to_string(thread_index) + "-" + std::to_string(sequence);
-}
-
-std::string bench_count_key(std::size_t process_index, std::size_t thread_index) {
-    return "bench-count-" + std::to_string(process_index) + "-" + std::to_string(thread_index);
-}
-
-std::string doc_count_key(std::size_t process_index) {
-    return "doc-count-" + std::to_string(process_index);
+    stats.latency_ns_total += latency_ns;
+    stats.latency_ns_max = std::max(stats.latency_ns_max, latency_ns);
+    stats.completed_retries.push_back(retries_for_write);
+    stats.completed_latency_ns.push_back(latency_ns);
 }
 
 std::string doc_key(std::size_t key_index) {
@@ -169,6 +141,25 @@ std::size_t choose_doc_transaction_key_count(std::mt19937_64& rng) {
     return dist(rng);
 }
 
+struct BenchMsgpackWrite {
+    std::string key;
+    std::string op;
+    std::vector<uint8_t> meta;
+    std::vector<uint8_t> payload;
+};
+
+struct BenchMsgpackProposal {
+    uint64_t last_observed_transaction = 0;
+    std::vector<std::string> read_set;
+    std::vector<BenchMsgpackWrite> writes;
+};
+
+std::vector<std::byte> bench_msgpack_bytes(const BenchMsgpackProposal& proposal) {
+    const auto raw = rfl::msgpack::write(proposal);
+    const auto view = std::as_bytes(std::span{raw.data(), raw.size()});
+    return {view.begin(), view.end()};
+}
+
 bool bytes_equal(byteview a, byteview b) {
     return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size()) == 0;
 }
@@ -188,395 +179,13 @@ bool bytes_equal_blocks(std::span<const byteview> blocks, byteview expected) {
     return offset == expected.size();
 }
 
-outcome::status_result<std::string> make_temp_log_path() {
-    OUTCOME_TRY(auto dir, llfio::path_discovery::storage_backed_temporary_files_directory().current_path());
-    std::string path = dir.string();
-    if (!path.empty() && path.back() != '/') {
-        path.push_back('/');
-    }
-    path += "borinkdb-bench-";
-    path += std::to_string(static_cast<unsigned long long>(
-        Clock::now().time_since_epoch().count()));
-    path += ".log";
-    return path;
-}
-
-outcome::status_result<void> unlink_path(std::string_view path) {
-    OUTCOME_TRY(auto h, llfio::file_handle::file(
-        {},
-        llfio::path_view(path.data(), path.size(), llfio::path_view::not_zero_terminated),
-        llfio::file_handle::mode::write,
-        llfio::file_handle::creation::open_existing));
-    OUTCOME_TRYV(h.unlink());
-    return llfio::success();
-}
-
-Stats run_thread_worker(std::string_view path,
-                        std::size_t process_index,
-                        std::size_t thread_index,
-                        Clock::time_point end_time,
-                        uint64_t target_per_second,
-                        const Options& options) {
-    Stats stats;
-    auto opened = bytelog::FileLog::open(path);
-    if (!opened) {
-        stats.errors = 1;
-        return stats;
-    }
-
-    const auto payload = bytes("benchmark-payload");
-    const auto meta = bytes("benchmark-meta");
-    const std::optional<std::chrono::nanoseconds> interval =
-        target_per_second == 0
-            ? std::nullopt
-            : std::optional<std::chrono::nanoseconds>{
-                  std::chrono::nanoseconds{1000000000ll / static_cast<long long>(target_per_second)}};
-    auto next_start = Clock::now();
-    uint64_t sequence = 0;
-    std::mt19937_64 jitter_rng{
-        static_cast<uint64_t>(process_index * 0x9E3779B97F4A7C15ull) ^
-        static_cast<uint64_t>(thread_index + 1)};
-    std::uniform_int_distribution<uint64_t> jitter_dist{0, options.retry_jitter_us};
-
-    while (Clock::now() < end_time) {
-        if (interval.has_value()) {
-            next_start += *interval;
-            std::this_thread::sleep_until(next_start);
-            if (Clock::now() >= end_time) {
-                break;
-            }
-        }
-
-        const std::string key = bench_key(process_index, thread_index, sequence);
-
-        const auto started = Clock::now();
-        uint64_t retries_for_write = 0;
-        for (;;) {
-            ++stats.attempts;
-            auto handle = opened.value()->tx([&](bytelog::TransactionContext& tx) -> outcome::status_result<void> {
-                OUTCOME_TRYV(tx.overwrite(key, meta, payload));
-                return outcome::success();
-            });
-            if (!handle) {
-                ++stats.errors;
-                break;
-            }
-            auto put = handle.value()->wait();
-            if (!put) {
-                ++stats.errors;
-                break;
-            }
-            if (put.value().outcome == bytelog::PutOutcome::Success) {
-                const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started);
-                const auto ns = static_cast<uint64_t>(elapsed.count());
-                ++stats.logical_successes;
-                ++sequence;
-                record_retries_per_success(stats, retries_for_write);
-                stats.latency_ns_total += ns;
-                stats.latency_ns_max = std::max(stats.latency_ns_max, ns);
-                break;
-            }
-
-            ++stats.retries;
-            ++retries_for_write;
-            const uint64_t delay_us = options.retry_backoff_us +
-                                      (options.retry_jitter_us == 0 ? 0 : jitter_dist(jitter_rng));
-            if (delay_us == 0) {
-                std::this_thread::yield();
-            } else {
-                std::this_thread::sleep_for(std::chrono::microseconds{static_cast<long long>(delay_us)});
-            }
-            if (Clock::now() >= end_time) {
-                break;
-            }
-        }
-    }
-
-    // Verification needs exact per-writer counts. Store that as a normal log
-    // record after the timed region, but do not include it in throughput stats.
-    const auto count_payload = bytes(std::to_string(sequence));
-    const auto count_key = bench_count_key(process_index, thread_index);
-    for (int attempt = 0; attempt < 100; ++attempt) {
-        auto handle = opened.value()->tx([&](bytelog::TransactionContext& tx) -> outcome::status_result<void> {
-            OUTCOME_TRYV(tx.overwrite(count_key, byteview{}, count_payload));
-            return outcome::success();
-        });
-        if (!handle) {
-            ++stats.errors;
-            break;
-        }
-        auto put = handle.value()->wait();
-        if (!put) {
-            ++stats.errors;
-            break;
-        }
-        if (put.value().outcome == bytelog::PutOutcome::Success) {
-            break;
-        }
-        std::this_thread::yield();
-    }
-
-    return stats;
-}
-
-Stats run_doc_process_worker(std::string_view path,
-                             std::size_t process_index,
-                             std::chrono::milliseconds duration,
-                             const Options& options) {
-    Stats stats;
-    auto opened = bytelog::FileLog::open(path);
-    if (!opened) {
-        stats.errors = 1;
-        return stats;
-    }
-
-    constexpr std::size_t kUpdatesPerBatch = 25;
-    constexpr auto kBatchInterval = std::chrono::seconds{1};
-    const auto end_time = Clock::now() + duration;
-    auto next_batch = Clock::now();
-    uint64_t sequence = 0;
-    std::mt19937_64 rng{
-        static_cast<uint64_t>(process_index + 1) * 0x9E3779B97F4A7C15ull ^
-        static_cast<uint64_t>(duration.count())};
-    std::mt19937_64 jitter_rng{
-        static_cast<uint64_t>(process_index + 17) * 0xD1B54A32D192ED03ull};
-    std::uniform_int_distribution<uint64_t> jitter_dist{0, options.retry_jitter_us};
-
-    struct PendingUpdate {
-        std::vector<std::size_t> keys;
-        std::vector<std::byte> payload;
-        std::string meta_prefix;
-        Clock::time_point started;
-        uint64_t retries = 0;
-    };
-
-    auto submit_update = [&](const PendingUpdate& update) {
-        return opened.value()->tx([update](bytelog::TransactionContext& tx) -> outcome::status_result<void> {
-            for (const auto key_index : update.keys) {
-                OUTCOME_TRY(auto ignored, tx.get(doc_key(key_index)));
-                (void) ignored;
-            }
-            for (std::size_t i = 0; i < update.keys.size(); ++i) {
-                const auto meta = bytes(update.meta_prefix + std::to_string(i) + ":" + std::to_string(update.keys.size()));
-                OUTCOME_TRYV(tx.put_if(doc_key(update.keys[i]), meta, update.payload));
-            }
-            return outcome::success();
-        });
-    };
-
-    while (Clock::now() < end_time) {
-        next_batch += kBatchInterval;
-
-        std::vector<std::unique_ptr<bytelog::TxHandle>> handles;
-        handles.reserve(kUpdatesPerBatch);
-        std::vector<PendingUpdate> pending;
-        pending.reserve(kUpdatesPerBatch);
-
-        for (std::size_t update_index = 0; update_index < kUpdatesPerBatch; ++update_index) {
-            if (Clock::now() >= end_time) {
-                break;
-            }
-
-            std::set<std::size_t> unique_keys;
-            const auto desired_key_count = choose_doc_transaction_key_count(rng);
-            while (unique_keys.size() < desired_key_count) {
-                unique_keys.insert(choose_doc_key(rng));
-            }
-            const auto tx_id = doc_tx_id(process_index, sequence++);
-            pending.push_back(PendingUpdate{
-                .keys = {unique_keys.begin(), unique_keys.end()},
-                .payload = bytes("doc-payload:" + tx_id),
-                .meta_prefix = "doc-tx:" + tx_id + ":",
-                .started = Clock::now(),
-            });
-
-            auto handle = submit_update(pending.back());
-            if (!handle) {
-                ++stats.errors;
-                pending.pop_back();
-                continue;
-            }
-            handles.push_back(std::move(handle.value()));
-        }
-
-        for (std::size_t i = 0; i < handles.size(); ++i) {
-            for (;;) {
-                ++stats.attempts;
-                auto put = handles[i]->wait();
-                if (!put) {
-                    ++stats.errors;
-                    break;
-                }
-                if (put.value().outcome == bytelog::PutOutcome::Success) {
-                    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - pending[i].started);
-                    const auto ns = static_cast<uint64_t>(elapsed.count());
-                    ++stats.logical_successes;
-                    stats.logical_key_writes += pending[i].keys.size();
-                    record_retries_per_success(stats, pending[i].retries);
-                    stats.latency_ns_total += ns;
-                    stats.latency_ns_max = std::max(stats.latency_ns_max, ns);
-                    break;
-                }
-
-                ++stats.retries;
-                ++pending[i].retries;
-                const uint64_t delay_us = options.retry_backoff_us +
-                                          (options.retry_jitter_us == 0 ? 0 : jitter_dist(jitter_rng));
-                if (delay_us == 0) {
-                    std::this_thread::yield();
-                } else {
-                    std::this_thread::sleep_for(std::chrono::microseconds{static_cast<long long>(delay_us)});
-                }
-
-                // Resubmit the same deterministic update after a normal OCC
-                // retry. The transaction callback itself remains side-effect
-                // free; only this outer harness counts attempts.
-                if (Clock::now() >= end_time) {
-                    break;
-                }
-                auto retry_handle = submit_update(pending[i]);
-                if (!retry_handle) {
-                    ++stats.errors;
-                    break;
-                }
-                handles[i] = std::move(retry_handle.value());
-            }
-        }
-
-        std::this_thread::sleep_until(next_batch);
-    }
-
-    const auto count_payload = bytes(std::to_string(stats.logical_successes) + ":" + std::to_string(stats.logical_key_writes));
-    const auto count_key = doc_count_key(process_index);
-    auto handle = opened.value()->tx([&](bytelog::TransactionContext& tx) -> outcome::status_result<void> {
-        OUTCOME_TRYV(tx.overwrite(count_key, byteview{}, count_payload));
-        return outcome::success();
-    });
-    if (!handle || !handle.value()->wait()) {
-        ++stats.errors;
-    }
-    return stats;
-}
-
-Stats run_process_workers(std::string_view path,
-                          std::size_t process_index,
-                          std::size_t threads_per_process,
-                          std::chrono::milliseconds duration,
-                          uint64_t target_per_writer_per_second,
-                          const Options& options) {
-    const auto end_time = Clock::now() + duration;
-    std::mutex mutex;
-    Stats combined;
-    std::vector<std::thread> threads;
-    threads.reserve(threads_per_process);
-
-    for (std::size_t thread_index = 0; thread_index < threads_per_process; ++thread_index) {
-        threads.emplace_back([&, thread_index] {
-            auto stats = run_thread_worker(
-                path,
-                process_index,
-                thread_index,
-                end_time,
-                target_per_writer_per_second,
-                options);
-            std::lock_guard lock(mutex);
-            add_stats(combined, stats);
-        });
-    }
-    for (auto& thread : threads) {
-        thread.join();
-    }
-    return combined;
-}
-
 std::optional<uint64_t> parse_u64(std::string_view value);
-
-struct ParsedBenchKey {
-    std::size_t process_index = 0;
-    std::size_t thread_index = 0;
-    uint64_t sequence = 0;
-};
-
-struct ParsedCountKey {
-    std::size_t process_index = 0;
-    std::size_t thread_index = 0;
-};
-
-struct WorkerVerification {
-    bool marker_seen = false;
-    uint64_t marker_count = 0;
-    std::vector<uint64_t> sequences;
-};
 
 struct DocMeta {
     std::string tx_id;
     std::size_t key_index = 0;
     std::size_t key_count = 0;
 };
-
-std::optional<ParsedBenchKey> parse_bench_key(std::string_view key) {
-    constexpr std::string_view prefix = "bench-";
-    if (key.rfind(prefix, 0) != 0 || key.rfind("bench-count-", 0) == 0) {
-        return std::nullopt;
-    }
-
-    key.remove_prefix(prefix.size());
-    const auto first_dash = key.find('-');
-    if (first_dash == std::string_view::npos) {
-        return std::nullopt;
-    }
-    const auto second_dash = key.find('-', first_dash + 1);
-    if (second_dash == std::string_view::npos) {
-        return std::nullopt;
-    }
-
-    const auto process = parse_u64(key.substr(0, first_dash));
-    const auto thread = parse_u64(key.substr(first_dash + 1, second_dash - first_dash - 1));
-    const auto sequence = parse_u64(key.substr(second_dash + 1));
-    if (!process || !thread || !sequence) {
-        return std::nullopt;
-    }
-    return ParsedBenchKey{
-        .process_index = static_cast<std::size_t>(*process),
-        .thread_index = static_cast<std::size_t>(*thread),
-        .sequence = *sequence,
-    };
-}
-
-std::optional<ParsedCountKey> parse_count_key(std::string_view key) {
-    constexpr std::string_view prefix = "bench-count-";
-    if (key.rfind(prefix, 0) != 0) {
-        return std::nullopt;
-    }
-
-    key.remove_prefix(prefix.size());
-    const auto dash = key.find('-');
-    if (dash == std::string_view::npos) {
-        return std::nullopt;
-    }
-
-    const auto process = parse_u64(key.substr(0, dash));
-    const auto thread = parse_u64(key.substr(dash + 1));
-    if (!process || !thread) {
-        return std::nullopt;
-    }
-    return ParsedCountKey{
-        .process_index = static_cast<std::size_t>(*process),
-        .thread_index = static_cast<std::size_t>(*thread),
-    };
-}
-
-std::optional<std::size_t> parse_doc_count_key(std::string_view key) {
-    constexpr std::string_view prefix = "doc-count-";
-    if (key.rfind(prefix, 0) != 0) {
-        return std::nullopt;
-    }
-    auto parsed = parse_u64(key.substr(prefix.size()));
-    if (!parsed) {
-        return std::nullopt;
-    }
-    return static_cast<std::size_t>(*parsed);
-}
 
 std::optional<DocMeta> parse_doc_meta(byteview bytes) {
     const std::string_view text{reinterpret_cast<const char*>(bytes.data()), bytes.size()};
@@ -612,110 +221,8 @@ std::optional<DocMeta> parse_doc_meta(byteview bytes) {
     };
 }
 
-std::optional<std::pair<uint64_t, uint64_t>> parse_doc_marker(byteview bytes) {
-    const std::string_view text{reinterpret_cast<const char*>(bytes.data()), bytes.size()};
-    const auto colon = text.find(':');
-    if (colon == std::string_view::npos) {
-        return std::nullopt;
-    }
-    const auto successes = parse_u64(text.substr(0, colon));
-    const auto key_writes = parse_u64(text.substr(colon + 1));
-    if (!successes || !key_writes) {
-        return std::nullopt;
-    }
-    return std::pair{*successes, *key_writes};
-}
-
-outcome::status_result<Stats> verify_scenario(std::string_view path, const Scenario& scenario) {
-    OUTCOME_TRY(auto reader, filelog::LogFile::open(path));
-
-    const auto expected_payload = bytes("benchmark-payload");
-    Stats verification;
-    std::vector<WorkerVerification> workers(scenario.processes * scenario.threads_per_process);
-
-    auto worker_index = [&](std::size_t process_index, std::size_t thread_index) -> std::optional<std::size_t> {
-        if (process_index >= scenario.processes || thread_index >= scenario.threads_per_process) {
-            return std::nullopt;
-        }
-        return process_index * scenario.threads_per_process + thread_index;
-    };
-
-    OUTCOME_TRYV(reader->visit_records([&](std::string_view key, const filelog::LogRecordView& record) {
-        if (const auto count_key = parse_count_key(key)) {
-            const auto index = worker_index(count_key->process_index, count_key->thread_index);
-            if (!index.has_value() || record.payload_blocks().size() != 1) {
-                ++verification.corrupt;
-                return;
-            }
-            const auto count_bytes = record.payload_blocks().front();
-            const std::string_view count_text{
-                reinterpret_cast<const char*>(count_bytes.data()),
-                count_bytes.size(),
-            };
-            const auto parsed_count = parse_u64(count_text);
-            if (!parsed_count.has_value()) {
-                ++verification.corrupt;
-                return;
-            }
-
-            auto& worker = workers[*index];
-            worker.marker_seen = true;
-            worker.marker_count = *parsed_count;
-            return;
-        }
-
-        const auto parsed = parse_bench_key(key);
-        if (!parsed.has_value()) {
-            return;
-        }
-        const auto index = worker_index(parsed->process_index, parsed->thread_index);
-        if (!index.has_value()) {
-            ++verification.corrupt;
-            return;
-        }
-
-        auto& worker = workers[*index];
-        worker.sequences.push_back(parsed->sequence);
-        ++verification.verified;
-        if (!bytes_equal_blocks(record.payload_blocks(), expected_payload)) {
-            ++verification.corrupt;
-        }
-    }));
-
-    for (const auto& worker : workers) {
-        if (!worker.marker_seen) {
-            ++verification.missing;
-            verification.verification_candidates += worker.sequences.size();
-            continue;
-        }
-
-        verification.verification_candidates += worker.marker_count;
-        auto sequences = worker.sequences;
-        std::sort(sequences.begin(), sequences.end());
-
-        uint64_t unique_expected_sequences = 0;
-        std::optional<uint64_t> previous;
-        for (const uint64_t sequence : sequences) {
-            if (previous.has_value() && *previous == sequence) {
-                ++verification.extra_physical_records;
-                continue;
-            }
-            previous = sequence;
-            if (sequence < worker.marker_count) {
-                ++unique_expected_sequences;
-            } else {
-                ++verification.extra_physical_records;
-            }
-        }
-        if (unique_expected_sequences < worker.marker_count) {
-            verification.missing += worker.marker_count - unique_expected_sequences;
-        }
-    }
-    return verification;
-}
-
-outcome::status_result<Stats> verify_doc_scenario(std::string_view path, const Scenario& scenario) {
-    OUTCOME_TRY(auto reader, filelog::LogFile::open(path));
+outcome::status_result<Stats> verify_proposal_scenario(std::string_view canonical_path) {
+    OUTCOME_TRY(auto reader, filelog::LogFile::open(canonical_path));
 
     struct SeenTransaction {
         std::size_t expected_key_count = 0;
@@ -728,27 +235,14 @@ outcome::status_result<Stats> verify_doc_scenario(std::string_view path, const S
     };
 
     Stats verification;
-    std::vector<bool> marker_seen(scenario.processes, false);
-    uint64_t marker_successes = 0;
-    uint64_t marker_key_writes = 0;
     std::map<std::string, SeenTransaction> transactions;
+    std::set<std::pair<uint64_t, uint64_t>> failed_transactions;
     std::map<std::tuple<uint64_t, uint64_t, uint16_t>, SeenBlock> blocks;
     std::set<std::pair<uint64_t, uint64_t>> logical_blocks;
 
     OUTCOME_TRYV(reader->visit_records([&](std::string_view key, const filelog::LogRecordView& record) {
-        if (const auto process_index = parse_doc_count_key(key)) {
-            if (*process_index >= scenario.processes || record.payload_blocks().size() != 1) {
-                ++verification.corrupt;
-                return;
-            }
-            const auto marker = parse_doc_marker(record.payload_blocks().front());
-            if (!marker) {
-                ++verification.corrupt;
-                return;
-            }
-            marker_seen[*process_index] = true;
-            marker_successes += marker->first;
-            marker_key_writes += marker->second;
+        if (key == kFailedKey) {
+            failed_transactions.insert({record.transaction_ref_hi(), record.transaction_ref_lo()});
             return;
         }
 
@@ -777,6 +271,7 @@ outcome::status_result<Stats> verify_doc_scenario(std::string_view path, const S
         if (!tx.seen_key_indexes.insert(meta->key_index).second) {
             tx.corrupt = true;
         }
+
         auto& block = blocks[{record.id_hi(), record.id_lo(), record.group_index()}];
         ++block.key_records;
         block.transaction_ids.insert(meta->tx_id);
@@ -784,19 +279,12 @@ outcome::status_result<Stats> verify_doc_scenario(std::string_view path, const S
         ++verification.verified;
     }));
 
-    for (bool seen : marker_seen) {
-        if (!seen) {
-            ++verification.missing;
-        }
-    }
-
-    verification.verification_candidates = marker_key_writes;
-    if (transactions.size() < marker_successes) {
-        verification.missing += marker_successes - transactions.size();
-    } else if (transactions.size() > marker_successes) {
-        verification.extra_physical_records += transactions.size() - marker_successes;
-    }
-
+    verification.logical_successes = transactions.size();
+    verification.logical_key_writes = verification.verified;
+    verification.retries = failed_transactions.size();
+    verification.attempts = verification.logical_successes + verification.retries;
+    verification.retries_per_success_hist[0] = verification.logical_successes;
+    verification.verification_candidates = verification.verified;
     for (const auto& [_, tx] : transactions) {
         if (tx.corrupt) {
             ++verification.corrupt;
@@ -810,7 +298,6 @@ outcome::status_result<Stats> verify_doc_scenario(std::string_view path, const S
             }
         }
     }
-
     verification.physical_blocks = blocks.size();
     verification.logical_blocks = logical_blocks.size();
     for (const auto& [_, block] : blocks) {
@@ -820,126 +307,251 @@ outcome::status_result<Stats> verify_doc_scenario(std::string_view path, const S
         verification.max_keys_per_block =
             std::max<uint64_t>(verification.max_keys_per_block, block.key_records);
     }
-
     return verification;
 }
 
-#if !defined(_WIN32)
-bool write_all(int fd, const void* data, std::size_t size) {
-    const auto* p = static_cast<const char*>(data);
-    std::size_t written = 0;
-    while (written < size) {
-        const ssize_t n = write(fd, p + written, size - written);
-        if (n <= 0) {
-            return false;
-        }
-        written += static_cast<std::size_t>(n);
-    }
-    return true;
+struct CanonicalResult {
+    bool success = false;
+};
+
+struct CanonicalSnapshot {
+    uint64_t version = 0;
+    std::unordered_map<std::string, CanonicalResult> proposal_results;
+};
+
+std::string proposal_tx_key(filelog::CommitResult id) {
+    return std::to_string(id.id_hi) + ":" + std::to_string(id.id_lo);
 }
 
-bool read_all(int fd, void* data, std::size_t size) {
-    auto* p = static_cast<char*>(data);
-    std::size_t read_bytes = 0;
-    while (read_bytes < size) {
-        const ssize_t n = read(fd, p + read_bytes, size - read_bytes);
-        if (n <= 0) {
-            return false;
+outcome::status_result<CanonicalSnapshot> scan_canonical(std::string_view canonical_path) {
+    CanonicalSnapshot snapshot;
+    OUTCOME_TRY(auto reader, filelog::LogFile::open(canonical_path));
+    OUTCOME_TRYV(reader->visit_records([&](std::string_view key, const filelog::LogRecordView& record) {
+        snapshot.version = std::max(snapshot.version, record.id_hi());
+        if (record.transaction_ref_hi() == 0 && record.transaction_ref_lo() == 0) {
+            return;
         }
-        read_bytes += static_cast<std::size_t>(n);
-    }
-    return true;
+
+        const auto tx = proposal_tx_key(filelog::CommitResult{
+            .id_hi = record.transaction_ref_hi(),
+            .id_lo = record.transaction_ref_lo(),
+        });
+        snapshot.proposal_results[tx] = CanonicalResult{.success = key != kFailedKey};
+    }));
+    return snapshot;
 }
-#endif
+
+struct PendingTransaction {
+    std::size_t writer_index = 0;
+    uint64_t logical_sequence = 0;
+    Clock::time_point started{};
+    std::vector<std::size_t> key_indexes;
+    std::optional<filelog::CommitResult> in_flight;
+    uint64_t retries = 0;
+};
+
+struct ProposalWriter {
+    std::unique_ptr<filelog::LogFile> log;
+    std::deque<PendingTransaction> pending;
+    uint64_t next_logical_sequence = 0;
+    uint64_t next_proposal_sequence = 1;
+    std::mt19937_64 rng;
+};
+
+std::vector<std::size_t> choose_transaction_keys(std::mt19937_64& rng) {
+    std::set<std::size_t> unique_keys;
+    const auto desired_key_count = choose_doc_transaction_key_count(rng);
+    while (unique_keys.size() < desired_key_count) {
+        unique_keys.insert(choose_doc_key(rng));
+    }
+    return {unique_keys.begin(), unique_keys.end()};
+}
+
+filelog::CommitResult next_proposal_id(ProposalWriter& writer, std::size_t writer_index) {
+    return filelog::CommitResult{
+        .id_hi = (static_cast<uint64_t>(writer_index) << 32U) | writer.next_proposal_sequence++,
+        .id_lo = 0xBDBDBDBD00000000ull | static_cast<uint64_t>(writer_index),
+    };
+}
+
+BenchMsgpackProposal make_bench_proposal(const PendingTransaction& tx, uint64_t observed_version) {
+    const auto tx_id = doc_tx_id(tx.writer_index, tx.logical_sequence);
+    BenchMsgpackProposal proposal{
+        .last_observed_transaction = observed_version,
+        .read_set = {},
+        .writes = {},
+    };
+    proposal.read_set.reserve(tx.key_indexes.size());
+    proposal.writes.reserve(tx.key_indexes.size());
+    for (const auto key_index : tx.key_indexes) {
+        const auto key = doc_key(key_index);
+        proposal.read_set.push_back(key);
+        const auto meta_text = "doc-tx:" + tx_id + ":" +
+                               std::to_string(proposal.writes.size()) + ":" +
+                               std::to_string(tx.key_indexes.size());
+        const auto payload_text = "doc-payload:" + tx_id;
+        proposal.writes.push_back(BenchMsgpackWrite{
+            .key = key,
+            .op = "put_if",
+            .meta = {meta_text.begin(), meta_text.end()},
+            .payload = {payload_text.begin(), payload_text.end()},
+        });
+    }
+    return proposal;
+}
+
+void enqueue_new_transactions(ProposalWriter& writer,
+                              std::size_t writer_index,
+                              std::size_t count,
+                              Clock::time_point now) {
+    for (std::size_t i = 0; i < count; ++i) {
+        writer.pending.push_back(PendingTransaction{
+            .writer_index = writer_index,
+            .logical_sequence = writer.next_logical_sequence++,
+            .started = now,
+            .key_indexes = choose_transaction_keys(writer.rng),
+            .in_flight = std::nullopt,
+            .retries = 0,
+        });
+    }
+}
+
+outcome::status_result<void> append_ready_proposals(ProposalWriter& writer,
+                                                    std::size_t writer_index,
+                                                    uint64_t observed_version,
+                                                    Stats& stats) {
+    std::vector<filelog::TransactionEntry> records;
+    std::vector<std::string> keys;
+    std::vector<std::vector<std::byte>> payloads;
+    records.reserve(writer.pending.size());
+    keys.reserve(writer.pending.size());
+    payloads.reserve(writer.pending.size());
+
+    for (auto& tx : writer.pending) {
+        if (tx.in_flight.has_value()) {
+            continue;
+        }
+        tx.in_flight = next_proposal_id(writer, writer_index);
+        payloads.push_back(bench_msgpack_bytes(make_bench_proposal(tx, observed_version)));
+        keys.push_back(std::string{kProposalKeyPrefix} + proposal_tx_key(*tx.in_flight));
+        records.push_back(filelog::TransactionEntry{
+            .key = keys.back(),
+            .meta_bytes = {},
+            .payload_bytes = payloads.back(),
+        });
+        ++stats.attempts;
+    }
+
+    if (!records.empty()) {
+        OUTCOME_TRY(auto ignored, writer.log->commit_transaction(records));
+        (void) ignored;
+    }
+    return outcome::success();
+}
+
+void apply_proposal_results(ProposalWriter& writer,
+                            const CanonicalSnapshot& snapshot,
+                            Clock::time_point now,
+                            Stats& stats) {
+    for (auto it = writer.pending.begin(); it != writer.pending.end();) {
+        if (!it->in_flight.has_value()) {
+            ++it;
+            continue;
+        }
+
+        const auto result = snapshot.proposal_results.find(proposal_tx_key(*it->in_flight));
+        if (result == snapshot.proposal_results.end()) {
+            ++it;
+            continue;
+        }
+
+        if (result->second.success) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now - it->started);
+            stats.logical_key_writes += it->key_indexes.size();
+            record_completed_transaction(stats, it->retries, static_cast<uint64_t>(elapsed.count()));
+            it = writer.pending.erase(it);
+        } else {
+            ++stats.retries;
+            ++it->retries;
+            it->in_flight = std::nullopt;
+            ++it;
+        }
+    }
+}
+
+bool has_pending_transactions(const std::vector<ProposalWriter>& writers) {
+    return std::any_of(writers.begin(), writers.end(), [](const ProposalWriter& writer) {
+        return !writer.pending.empty();
+    });
+}
 
 outcome::status_result<Stats> run_scenario(const Scenario& scenario, const Options& options) {
-    OUTCOME_TRY(auto path, make_temp_log_path());
-    {
-        OUTCOME_TRY(auto created, bytelog::FileLog::open(path));
-    }
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("borinkdb-proposal-bench-" + std::to_string(Clock::now().time_since_epoch().count()));
+    const std::string epoch = "epoch-bench";
+    const auto proposals_dir = root / epoch / "proposals";
+    const auto canonical_path = root / epoch / "canonical.log";
+    std::filesystem::create_directories(proposals_dir);
 
-#if defined(_WIN32)
-    if (scenario.processes != 1) {
-        OUTCOME_TRYV(unlink_path(path));
-        return filelog::Error::bad_argument;
-    }
-    auto stats = scenario.doc_workload
-                     ? run_doc_process_worker(path, 0, options.duration, options)
-                     : run_process_workers(
-                           path,
-                           0,
-                           scenario.threads_per_process,
-                           options.duration,
-                           scenario.target_per_writer_per_second,
-                           options);
-#else
     Stats stats;
-    std::vector<pid_t> children;
-    std::vector<int> read_fds;
-    children.reserve(scenario.processes);
-    read_fds.reserve(scenario.processes);
-
-    for (std::size_t process_index = 0; process_index < scenario.processes; ++process_index) {
-        int fds[2] = {-1, -1};
-        if (pipe(fds) != 0) {
-            OUTCOME_TRYV(unlink_path(path));
-            return filelog::Error::bad_argument;
-        }
-
-        const pid_t pid = fork();
-        if (pid < 0) {
-            close(fds[0]);
-            close(fds[1]);
-            OUTCOME_TRYV(unlink_path(path));
-            return filelog::Error::bad_argument;
-        }
-        if (pid == 0) {
-            close(fds[0]);
-            const auto child_stats = scenario.doc_workload
-                                         ? run_doc_process_worker(path, process_index, options.duration, options)
-                                         : run_process_workers(
-                                               path,
-                                               process_index,
-                                               scenario.threads_per_process,
-                                               options.duration,
-                                               scenario.target_per_writer_per_second,
-                                               options);
-            const bool wrote = write_all(fds[1], &child_stats, sizeof(child_stats));
-            close(fds[1]);
-            std::_Exit(wrote ? 0 : 1);
-        }
-
-        close(fds[1]);
-        children.push_back(pid);
-        read_fds.push_back(fds[0]);
+    std::vector<ProposalWriter> writers;
+    writers.reserve(scenario.processes);
+    for (std::size_t writer_index = 0; writer_index < scenario.processes; ++writer_index) {
+        OUTCOME_TRY(auto log, filelog::LogFile::open((proposals_dir / ("writer-" + std::to_string(writer_index) + ".log")).string()));
+        writers.push_back(ProposalWriter{
+            .log = std::move(log),
+            .pending = {},
+            .next_logical_sequence = 0,
+            .next_proposal_sequence = 1,
+            .rng = std::mt19937_64{
+                static_cast<uint64_t>(writer_index + 1) * 0x9E3779B97F4A7C15ull ^
+                static_cast<uint64_t>(options.duration.count())},
+        });
     }
 
-    for (int fd : read_fds) {
-        Stats child_stats;
-        if (!read_all(fd, &child_stats, sizeof(child_stats))) {
-            ++stats.errors;
-        } else {
-            add_stats(stats, child_stats);
+    uint64_t observed_version = 0;
+    const auto end_time = Clock::now() + options.duration;
+    auto next_batch = Clock::now();
+    const auto per_writer_batch = static_cast<std::size_t>(
+        std::max<uint64_t>(1, scenario.target_per_writer_per_second));
+
+    while (Clock::now() < end_time || has_pending_transactions(writers)) {
+        const auto generating = Clock::now() < end_time;
+        if (generating) {
+            next_batch += std::chrono::seconds{1};
+            const auto now = Clock::now();
+            for (std::size_t writer_index = 0; writer_index < writers.size(); ++writer_index) {
+                enqueue_new_transactions(writers[writer_index], writer_index, per_writer_batch, now);
+            }
         }
-        close(fd);
+
+        for (std::size_t writer_index = 0; writer_index < writers.size(); ++writer_index) {
+            OUTCOME_TRYV(append_ready_proposals(writers[writer_index], writer_index, observed_version, stats));
+        }
+        OUTCOME_TRYV(borinkdb::coordinator::run_epoch_once(root, epoch, 1000000, true));
+        OUTCOME_TRY(auto snapshot, scan_canonical(canonical_path.string()));
+        observed_version = snapshot.version;
+        const auto now = Clock::now();
+        for (auto& writer : writers) {
+            apply_proposal_results(writer, snapshot, now, stats);
+        }
+
+        if (generating) {
+            std::this_thread::sleep_until(next_batch);
+        }
     }
 
-    for (const pid_t pid : children) {
-        int status = 0;
-        if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-            ++stats.errors;
-        }
+    OUTCOME_TRY(auto verification, verify_proposal_scenario(canonical_path.string()));
+    if (verification.logical_successes != stats.logical_successes ||
+        verification.logical_key_writes != stats.logical_key_writes ||
+        verification.retries != stats.retries) {
+        ++stats.corrupt;
     }
-#endif
-
-    OUTCOME_TRY(auto verification, scenario.doc_workload
-                                       ? verify_doc_scenario(path, scenario)
-                                       : verify_scenario(path, scenario));
     stats.verified = verification.verified;
     stats.verification_candidates = verification.verification_candidates;
     stats.extra_physical_records = verification.extra_physical_records;
     stats.missing = verification.missing;
-    stats.corrupt = verification.corrupt;
+    stats.corrupt += verification.corrupt;
     stats.incomplete_transactions = verification.incomplete_transactions;
     stats.physical_blocks = verification.physical_blocks;
     stats.logical_blocks = verification.logical_blocks;
@@ -947,7 +559,7 @@ outcome::status_result<Stats> run_scenario(const Scenario& scenario, const Optio
     stats.max_transactions_per_block = verification.max_transactions_per_block;
     stats.max_keys_per_block = verification.max_keys_per_block;
 
-    OUTCOME_TRYV(unlink_path(path));
+    std::filesystem::remove_all(root);
     return stats;
 }
 
@@ -956,6 +568,13 @@ double as_double(uint64_t value) {
 }
 
 uint64_t retry_percentile(const Stats& stats, uint64_t percentile) {
+    if (!stats.completed_retries.empty()) {
+        auto values = stats.completed_retries;
+        std::sort(values.begin(), values.end());
+        const auto index = static_cast<std::size_t>(
+            std::min<uint64_t>(values.size() - 1, (values.size() * percentile + 99u) / 100u - 1u));
+        return values[index];
+    }
     if (stats.logical_successes == 0) {
         return 0;
     }
@@ -970,21 +589,37 @@ uint64_t retry_percentile(const Stats& stats, uint64_t percentile) {
     return kRetryHistogramBuckets - 1;
 }
 
+uint64_t latency_percentile_us(const Stats& stats, uint64_t percentile) {
+    if (stats.completed_latency_ns.empty()) {
+        return 0;
+    }
+    auto values = stats.completed_latency_ns;
+    std::sort(values.begin(), values.end());
+    const auto index = static_cast<std::size_t>(
+        std::min<uint64_t>(values.size() - 1, (values.size() * percentile + 99u) / 100u - 1u));
+    return values[index] / 1000u;
+}
+
 void print_result(const Scenario& scenario, const Options& options, const Stats& stats) {
     const auto writers = scenario.processes * scenario.threads_per_process;
     const auto duration_seconds = static_cast<double>(options.duration.count()) / 1000.0;
     const auto successes_per_second = as_double(stats.logical_successes) / duration_seconds;
     const auto key_writes_per_second = as_double(stats.logical_key_writes) / duration_seconds;
     const auto attempts_per_second = as_double(stats.attempts) / duration_seconds;
-    const auto retry_percent =
+    const auto retry_or_conflict_percent =
         stats.attempts == 0 ? 0.0 : (as_double(stats.retries) * 100.0 / as_double(stats.attempts));
     const auto avg_retries =
         stats.logical_successes == 0 ? 0.0 : as_double(stats.retries) / as_double(stats.logical_successes);
+    const auto p50_retries = retry_percentile(stats, 50);
+    const auto p90_retries = retry_percentile(stats, 90);
     const auto p95_retries = retry_percentile(stats, 95);
     const auto p99_retries = retry_percentile(stats, 99);
     const auto avg_latency_us =
         stats.logical_successes == 0 ? 0.0 : as_double(stats.latency_ns_total) / as_double(stats.logical_successes) / 1000.0;
     const auto max_latency_us = as_double(stats.latency_ns_max) / 1000.0;
+    const auto p50_latency_us = latency_percentile_us(stats, 50);
+    const auto p90_latency_us = latency_percentile_us(stats, 90);
+    const auto p99_latency_us = latency_percentile_us(stats, 99);
     const auto avg_keys_per_tx =
         stats.logical_successes == 0 ? 0.0 : as_double(stats.logical_key_writes) / as_double(stats.logical_successes);
     const auto avg_keys_per_block =
@@ -1003,15 +638,22 @@ void print_result(const Scenario& scenario, const Options& options, const Stats&
         << " successful_writes/s=" << std::fixed << std::setprecision(1) << successes_per_second
         << " key_writes/s=" << key_writes_per_second
         << " avg_keys/tx=" << avg_keys_per_tx
-        << " attempts/s=" << attempts_per_second
-        << " retries=" << stats.retries
-        << " retry%=" << retry_percent
+        << " attempts/s=" << attempts_per_second;
+    std::cout
+        << " conflicts=" << stats.retries
+        << " conflict%=" << retry_or_conflict_percent
         << " avg_retries/success=" << avg_retries
-        << " p95_retries/success=" << p95_retries
-        << " p99_retries/success=" << p99_retries
-        << " max_retries/success=" << stats.retries_per_success_max
+        << " p50_retries=" << p50_retries
+        << " p90_retries=" << p90_retries
+        << " p95_retries=" << p95_retries
+        << " p99_retries=" << p99_retries
+        << " pmax_retries=" << stats.retries_per_success_max
         << " avg_us=" << avg_latency_us
-        << " max_us=" << max_latency_us
+        << " p50_us=" << p50_latency_us
+        << " p90_us=" << p90_latency_us
+        << " p99_us=" << p99_latency_us
+        << " pmax_us=" << max_latency_us;
+    std::cout
         << " physical_blocks=" << stats.physical_blocks
         << " logical_blocks=" << stats.logical_blocks
         << " avg_physical/logical=" << avg_physical_blocks_per_logical
@@ -1079,35 +721,17 @@ Options parse_options(int argc, char** argv) {
 }
 
 std::vector<Scenario> scenarios_for(const Options& options) {
-    if (options.scenario_set == "doc" || options.scenario_set == "contention") {
+    if (options.scenario_set == "custom") {
         return {
-            Scenario{"doc 8 proc 25 tx/s", 8, 1, 25, true},
-        };
-    }
-
-    if (options.scenario_set == "5000") {
-        return {
-            Scenario{"1 proc 1 thread 5000/s", 1, 1, 5000},
-            Scenario{"2 proc 1 thread 5000/s", 2, 1, 5000},
-            Scenario{"4 proc 1 thread 5000/s", 4, 1, 5000},
-            Scenario{"8 proc 1 thread 5000/s", 8, 1, 5000},
-            Scenario{"4 proc 2 threads 5000/s", 4, 2, 5000},
-            Scenario{"8 proc 2 threads 5000/s", 8, 2, 5000},
+            Scenario{"proposal custom", 8, 1, options.target_per_writer_per_second},
         };
     }
 
     return {
-        Scenario{"single writer max", 1, 1, 0},
-        Scenario{"single proc 4 threads max", 1, 4, 0},
-        Scenario{"single proc 4 threads 100/s", 1, 4, 100},
-        Scenario{"single proc 4 threads 500/s", 1, 4, 500},
-        Scenario{"single proc 4 threads custom", 1, 4, options.target_per_writer_per_second},
-        Scenario{"2 proc 1 thread max", 2, 1, 0},
-        Scenario{"4 proc 1 thread 100/s", 4, 1, 100},
-        Scenario{"4 proc 1 thread 500/s", 4, 1, 500},
-        Scenario{"4 proc 2 threads 100/s", 4, 2, 100},
-        Scenario{"4 proc 2 threads 500/s", 4, 2, 500},
-        Scenario{"4 proc 2 threads custom", 4, 2, options.target_per_writer_per_second},
+        Scenario{"proposal 1 proc 25 tx/s", 1, 1, 25},
+        Scenario{"proposal 4 proc 25 tx/s", 4, 1, 25},
+        Scenario{"proposal 8 proc 25 tx/s", 8, 1, 25},
+        Scenario{"proposal 8 proc 50 tx/s", 8, 1, 50},
     };
 }
 
@@ -1124,7 +748,7 @@ int run(int argc, char** argv) {
               << " retry_backoff_us=" << options.retry_backoff_us
               << " retry_jitter_us=" << options.retry_jitter_us
               << "\n"
-              << "target/writer/s=0 means unlimited; retries are normal PutOutcome::Retry results.\n"
+              << "proposal benchmarks retry coordinator conflicts until each logical transaction commits.\n"
               << "verification scans the log once after every scenario and checks all benchmark records.\n";
 
     for (const auto& scenario : scenarios) {
@@ -1137,6 +761,553 @@ int run(int argc, char** argv) {
         print_result(scenario, options, stats.value());
     }
 
+    return 0;
+}
+
+}
+
+namespace borinkdb::coordinator {
+namespace {
+
+namespace filelog = borinkdb::log::file;
+namespace outcome = OUTCOME_V2_NAMESPACE::experimental;
+using byteview = std::span<const std::byte>;
+
+constexpr std::string_view kProposalKeyPrefix = "__borinkdb/proposal/";
+constexpr std::string_view kFailedKey = "__borinkdb/tx/failed";
+constexpr std::string_view kFailedPayload = "failed";
+
+struct CoordOptions {
+    std::filesystem::path root = "borinkdb-coordinator";
+    std::string epoch;
+    std::chrono::milliseconds interval{1000};
+    std::size_t batch_limit = 1024;
+    bool once = false;
+    bool quiet = false;
+};
+
+enum class Operation {
+    PutIf,
+    Overwrite,
+};
+
+struct OwnedEntry {
+    std::string key;
+    std::vector<std::byte> meta;
+    std::vector<std::byte> payload;
+};
+
+struct MsgpackWrite {
+    std::string key;
+    std::string op;
+    std::vector<uint8_t> meta;
+    std::vector<uint8_t> payload;
+};
+
+struct MsgpackProposal {
+    uint64_t last_observed_transaction = 0;
+    std::vector<std::string> read_set;
+    std::vector<MsgpackWrite> writes;
+};
+
+struct ProposedWrite {
+    std::string key;
+    Operation operation = Operation::Overwrite;
+    std::vector<std::byte> meta;
+    std::vector<std::byte> payload;
+};
+
+struct ProposedTransaction {
+    filelog::CommitResult id;
+    uint64_t last_observed_transaction = 0;
+    std::vector<std::string> read_set;
+    std::vector<ProposedWrite> writes;
+};
+
+struct ProposalLog {
+    std::filesystem::path path;
+    std::unique_ptr<filelog::LogFile> log;
+};
+
+std::optional<uint64_t> parse_coord_u64(std::string_view value) {
+    uint64_t result = 0;
+    if (value.empty()) {
+        return std::nullopt;
+    }
+    for (const char ch : value) {
+        if (ch < '0' || ch > '9') {
+            return std::nullopt;
+        }
+        const uint64_t digit = static_cast<uint64_t>(ch - '0');
+        if (result > (UINT64_MAX - digit) / 10u) {
+            return std::nullopt;
+        }
+        result = result * 10u + digit;
+    }
+    return result;
+}
+
+std::vector<std::byte> coord_bytes(std::string_view text) {
+    const auto view = std::as_bytes(std::span{text.data(), text.size()});
+    return {view.begin(), view.end()};
+}
+
+std::optional<filelog::CommitResult> parse_tx_key(std::string_view key) {
+    const auto colon = key.find(':');
+    if (colon == std::string_view::npos) {
+        return std::nullopt;
+    }
+    const auto id_hi = parse_coord_u64(key.substr(0, colon));
+    const auto id_lo = parse_coord_u64(key.substr(colon + 1));
+    if (!id_hi || !id_lo) {
+        return std::nullopt;
+    }
+    return filelog::CommitResult{
+        .id_hi = *id_hi,
+        .id_lo = *id_lo,
+    };
+}
+
+std::optional<ProposedTransaction> parse_proposal_record(std::string_view key,
+                                                         const filelog::LogRecordView& record) {
+    if (key.rfind(kProposalKeyPrefix, 0) != 0) {
+        return std::nullopt;
+    }
+    auto tx_id = parse_tx_key(key.substr(kProposalKeyPrefix.size()));
+    if (!tx_id) {
+        return std::nullopt;
+    }
+    std::vector<std::byte> raw;
+    for (const auto block : record.payload_blocks()) {
+        raw.insert(raw.end(), block.begin(), block.end());
+    }
+    auto decoded = rfl::msgpack::read<MsgpackProposal>(raw);
+    if (!decoded) {
+        return std::nullopt;
+    }
+    auto msg = decoded.value();
+    ProposedTransaction proposal{
+        .id = *tx_id,
+        .last_observed_transaction = msg.last_observed_transaction,
+        .read_set = std::move(msg.read_set),
+        .writes = {},
+    };
+    proposal.writes.reserve(msg.writes.size());
+    for (auto& write : msg.writes) {
+        Operation op;
+        if (write.op == "put_if") {
+            op = Operation::PutIf;
+        } else if (write.op == "overwrite") {
+            op = Operation::Overwrite;
+        } else {
+            return std::nullopt;
+        }
+        proposal.writes.push_back(ProposedWrite{
+            .key = std::move(write.key),
+            .operation = op,
+            .meta = {reinterpret_cast<const std::byte*>(write.meta.data()),
+                     reinterpret_cast<const std::byte*>(write.meta.data() + write.meta.size())},
+            .payload = {reinterpret_cast<const std::byte*>(write.payload.data()),
+                        reinterpret_cast<const std::byte*>(write.payload.data() + write.payload.size())},
+        });
+    }
+    return proposal;
+}
+
+OwnedEntry failed_entry() {
+    return OwnedEntry{
+        .key = std::string{kFailedKey},
+        .meta = {},
+        .payload = coord_bytes(kFailedPayload),
+    };
+}
+
+std::vector<filelog::TransactionEntry> as_transaction_entries(std::vector<OwnedEntry>& entries) {
+    std::vector<filelog::TransactionEntry> out;
+    out.reserve(entries.size());
+    for (auto& entry : entries) {
+        out.push_back(filelog::TransactionEntry{
+            .key = entry.key,
+            .meta_bytes = entry.meta,
+            .payload_bytes = entry.payload,
+        });
+    }
+    return out;
+}
+
+std::string make_epoch_name() {
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+    std::random_device rd;
+    std::mt19937_64 rng{(static_cast<uint64_t>(rd()) << 32U) ^ static_cast<uint64_t>(millis)};
+    return "epoch-" + std::to_string(millis) + "-" + std::to_string(rng());
+}
+
+CoordOptions parse_coord_options(int argc, char** argv) {
+    CoordOptions options;
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view arg{argv[i]};
+        constexpr std::string_view root_prefix = "--coord-root=";
+        constexpr std::string_view epoch_prefix = "--coord-epoch=";
+        constexpr std::string_view interval_prefix = "--coord-interval-ms=";
+        constexpr std::string_view batch_prefix = "--coord-batch-limit=";
+        if (arg.rfind(root_prefix, 0) == 0) {
+            options.root = std::filesystem::path{std::string{arg.substr(root_prefix.size())}};
+        } else if (arg.rfind(epoch_prefix, 0) == 0) {
+            options.epoch = std::string{arg.substr(epoch_prefix.size())};
+        } else if (arg.rfind(interval_prefix, 0) == 0) {
+            if (const auto parsed = parse_coord_u64(arg.substr(interval_prefix.size()))) {
+                options.interval = std::chrono::milliseconds{static_cast<long long>(*parsed)};
+            }
+        } else if (arg.rfind(batch_prefix, 0) == 0) {
+            if (const auto parsed = parse_coord_u64(arg.substr(batch_prefix.size()))) {
+                options.batch_limit = static_cast<std::size_t>(*parsed);
+            }
+        } else if (arg == "--coord-once") {
+            options.once = true;
+        }
+    }
+    if (options.epoch.empty()) {
+        options.epoch = make_epoch_name();
+    }
+    return options;
+}
+
+std::string tx_key(filelog::CommitResult id) {
+    return std::to_string(id.id_hi) + ":" + std::to_string(id.id_lo);
+}
+
+outcome::status_result<void> load_seen(filelog::LogFile& canonical,
+                                       std::unordered_set<std::string>& seen,
+                                       uint64_t& next_canonical_id) {
+    OUTCOME_TRYV(canonical.visit_records([&](std::string_view, const filelog::LogRecordView& record) {
+        next_canonical_id = std::max(next_canonical_id, record.id_hi() + 1);
+        if (record.transaction_ref_hi() != 0 || record.transaction_ref_lo() != 0) {
+            seen.insert(tx_key(filelog::CommitResult{
+                .id_hi = record.transaction_ref_hi(),
+                .id_lo = record.transaction_ref_lo(),
+            }));
+        }
+    }));
+    return outcome::success();
+}
+
+outcome::status_result<std::vector<ProposedTransaction>> load_proposals(std::vector<ProposalLog*>& logs,
+                                                                        const std::unordered_set<std::string>& seen,
+                                                                        std::size_t batch_limit) {
+    std::map<std::string, ProposedTransaction> by_tx;
+    for (auto* proposal_log : logs) {
+        OUTCOME_TRYV(proposal_log->log->refresh());
+        OUTCOME_TRYV(proposal_log->log->visit_records([&](std::string_view key, const filelog::LogRecordView& record) {
+            if (by_tx.size() >= batch_limit) {
+                return;
+            }
+            auto proposal = parse_proposal_record(key, record);
+            if (!proposal || seen.contains(tx_key(proposal->id))) {
+                return;
+            }
+            by_tx.emplace(tx_key(proposal->id), std::move(*proposal));
+        }));
+    }
+
+    std::vector<ProposedTransaction> out;
+    out.reserve(by_tx.size());
+    for (auto& [_, tx] : by_tx) {
+        out.push_back(std::move(tx));
+    }
+    return out;
+}
+
+bool current_matches(filelog::LogFile& canonical,
+                     const std::unordered_set<std::string>& overlay,
+                     std::string_view key,
+                     uint64_t last_observed_transaction) {
+    if (overlay.contains(std::string{key})) {
+        return false;
+    }
+    auto current = canonical.get_record_view(key, filelog::LogReadMode::Cached);
+    if (!current) {
+        return false;
+    }
+    if (!current.value().has_value()) {
+        return true;
+    }
+    return current.value()->id_hi() <= last_observed_transaction;
+}
+
+outcome::status_result<std::size_t> process_batch(filelog::LogFile& canonical,
+                                                  const std::vector<ProposedTransaction>& batch,
+                                                  std::unordered_set<std::string>& seen,
+                                                  uint64_t& next_canonical_id) {
+    OUTCOME_TRYV(canonical.refresh());
+
+    std::unordered_set<std::string> overlay;
+    std::size_t finalized = 0;
+
+    for (const auto& tx : batch) {
+        const auto tx_id = tx_key(tx.id);
+        if (tx.writes.empty() || seen.contains(tx_id)) {
+            continue;
+        }
+
+        bool ok = true;
+        std::unordered_set<std::string> write_keys;
+        for (const auto& key : tx.read_set) {
+            if (!current_matches(canonical, overlay, key, tx.last_observed_transaction)) {
+                ok = false;
+                break;
+            }
+        }
+        for (const auto& write : tx.writes) {
+            if (!write_keys.insert(write.key).second) {
+                ok = false;
+                break;
+            }
+        }
+
+        std::vector<OwnedEntry> canonical_entries;
+        if (ok) {
+            for (const auto& entry : tx.writes) {
+                canonical_entries.push_back(OwnedEntry{
+                    .key = entry.key,
+                    .meta = entry.meta,
+                    .payload = entry.payload,
+                });
+                overlay.insert(entry.key);
+            }
+        } else {
+            canonical_entries.push_back(failed_entry());
+        }
+        auto transaction_entries = as_transaction_entries(canonical_entries);
+        OUTCOME_TRY(auto commit, canonical.commit_transaction(
+            transaction_entries,
+            filelog::CommitOptions{
+                .id = filelog::CommitResult{.id_hi = next_canonical_id++, .id_lo = 0},
+                .transaction_ref = tx.id,
+            }));
+        (void) commit;
+        seen.insert(tx_id);
+        ++finalized;
+    }
+    return finalized;
+}
+
+outcome::status_result<void> run_loop(const CoordOptions& options) {
+    const auto epoch_dir = options.root / options.epoch;
+    const auto proposals_dir = epoch_dir / "proposals";
+    const auto canonical_path = (epoch_dir / "canonical.log").string();
+
+    std::filesystem::create_directories(proposals_dir);
+    OUTCOME_TRY(auto canonical, filelog::LogFile::open(canonical_path));
+
+    std::unordered_set<std::string> seen;
+    uint64_t next_canonical_id = 1;
+    OUTCOME_TRYV(load_seen(*canonical, seen, next_canonical_id));
+
+    std::map<std::filesystem::path, ProposalLog> proposal_logs;
+    std::mt19937_64 rng{std::random_device{}()};
+
+    if (!options.quiet) {
+        std::cout << "coordinator epoch=" << epoch_dir.string()
+                  << " proposals=" << proposals_dir.string()
+                  << " canonical=" << canonical_path << '\n';
+    }
+
+    for (;;) {
+        for (const auto& entry : std::filesystem::directory_iterator(proposals_dir)) {
+            if (!entry.is_regular_file() || entry.path().extension() != ".log") {
+                continue;
+            }
+            if (proposal_logs.contains(entry.path())) {
+                continue;
+            }
+            auto opened = filelog::LogFile::open(entry.path().string());
+            if (!opened) {
+                std::cerr << "failed to open proposal log " << entry.path().string()
+                          << ": " << opened.error().message() << '\n';
+                continue;
+            }
+            proposal_logs.emplace(entry.path(), ProposalLog{
+                                                    .path = entry.path(),
+                                                    .log = std::move(opened.value()),
+                                                });
+        }
+
+        std::vector<ProposalLog*> logs;
+        logs.reserve(proposal_logs.size());
+        for (auto& [_, log] : proposal_logs) {
+            logs.push_back(&log);
+        }
+        std::shuffle(logs.begin(), logs.end(), rng);
+
+        OUTCOME_TRY(auto proposals, load_proposals(logs, seen, options.batch_limit));
+        if (!proposals.empty()) {
+            OUTCOME_TRY(auto finalized, process_batch(*canonical, proposals, seen, next_canonical_id));
+            if (!options.quiet) {
+                std::cout << "coordinator finalized=" << finalized
+                          << " seen=" << seen.size()
+                          << " proposal_logs=" << proposal_logs.size() << '\n';
+            }
+        }
+
+        if (options.once) {
+            return outcome::success();
+        }
+        std::this_thread::sleep_for(options.interval);
+    }
+}
+
+std::vector<std::byte> msgpack_bytes(const MsgpackProposal& proposal) {
+    const auto raw = rfl::msgpack::write(proposal);
+    const auto view = std::as_bytes(std::span{raw.data(), raw.size()});
+    return {view.begin(), view.end()};
+}
+
+outcome::status_result<void> write_proposal(std::filesystem::path path,
+                                            filelog::CommitResult tx_id,
+                                            const MsgpackProposal& proposal) {
+    OUTCOME_TRY(auto log, filelog::LogFile::open(path.string()));
+    auto payload = msgpack_bytes(proposal);
+    const auto key = std::string{kProposalKeyPrefix} + tx_key(tx_id);
+    const filelog::TransactionEntry entry{
+        .key = key,
+        .meta_bytes = {},
+        .payload_bytes = payload,
+    };
+    OUTCOME_TRY(auto commit, log->commit_transaction(
+                                 std::span<const filelog::TransactionEntry>{&entry, 1},
+                                 filelog::CommitOptions{.id = tx_id, .transaction_ref = {}}));
+    (void) commit;
+    return outcome::success();
+}
+
+outcome::status_result<bool> canonical_has_tx(filelog::LogFile& canonical,
+                                              filelog::CommitResult tx_id,
+                                              std::string_view expected_key,
+                                              std::string_view expected_payload) {
+    bool found = false;
+    OUTCOME_TRYV(canonical.visit_records([&](std::string_view key, const filelog::LogRecordView& record) {
+        if (record.transaction_ref_hi() != tx_id.id_hi || record.transaction_ref_lo() != tx_id.id_lo) {
+            return;
+        }
+        if (key != expected_key) {
+            return;
+        }
+        const auto expected = coord_bytes(expected_payload);
+        if (record.payload_blocks().size() == 1 &&
+            record.payload_blocks().front().size() == expected.size() &&
+            std::equal(record.payload_blocks().front().begin(), record.payload_blocks().front().end(), expected.begin())) {
+            found = true;
+        }
+    }));
+    return found;
+}
+
+outcome::status_result<void> proposer_committer_integration_test() {
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("borinkdb-coordinator-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const std::string epoch = "epoch-test";
+    const auto epoch_dir = root / epoch;
+    const auto proposals_dir = epoch_dir / "proposals";
+    std::filesystem::create_directories(proposals_dir);
+
+    const auto canonical_path = epoch_dir / "canonical.log";
+    OUTCOME_TRY(auto canonical, filelog::LogFile::open(canonical_path.string()));
+    {
+        auto meta = coord_bytes("seed");
+        auto one = coord_bytes("1");
+        auto five = coord_bytes("5");
+        std::array<filelog::TransactionEntry, 2> seed{
+            filelog::TransactionEntry{.key = "A", .meta_bytes = meta, .payload_bytes = one},
+            filelog::TransactionEntry{.key = "B", .meta_bytes = meta, .payload_bytes = five},
+        };
+        OUTCOME_TRY(auto seed_commit, canonical->commit_transaction(
+                                         seed,
+                                         filelog::CommitOptions{.id = filelog::CommitResult{.id_hi = 25, .id_lo = 0}, .transaction_ref = {}}));
+        (void) seed_commit;
+    }
+
+    const auto success_tx = filelog::CommitResult{.id_hi = 0xA, .id_lo = 0x1};
+    const auto failed_tx = filelog::CommitResult{.id_hi = 0xA, .id_lo = 0x2};
+    OUTCOME_TRYV(write_proposal(
+        proposals_dir / "writer-success.log",
+        success_tx,
+        MsgpackProposal{
+            .last_observed_transaction = 25,
+            .read_set = {"A", "B"},
+            .writes = {
+                MsgpackWrite{.key = "A", .op = "put_if", .meta = {}, .payload = {static_cast<uint8_t>('7')}},
+                MsgpackWrite{.key = "C", .op = "overwrite", .meta = {}, .payload = {static_cast<uint8_t>('1'), static_cast<uint8_t>('0')}},
+                MsgpackWrite{.key = "D", .op = "overwrite", .meta = {}, .payload = {static_cast<uint8_t>('1'), static_cast<uint8_t>('1')}},
+            },
+        }));
+
+    OUTCOME_TRYV(run_loop(CoordOptions{.root = root, .epoch = epoch, .interval = std::chrono::milliseconds{1}, .batch_limit = 16, .once = true}));
+    OUTCOME_TRYV(canonical->refresh());
+    OUTCOME_TRY(auto success_seen, canonical_has_tx(*canonical, success_tx, "A", "7"));
+    if (!success_seen) {
+        std::filesystem::remove_all(root);
+        return filelog::Error::bad_argument;
+    }
+    std::filesystem::remove(proposals_dir / "writer-success.log");
+
+    OUTCOME_TRYV(write_proposal(
+        proposals_dir / "writer-fail.log",
+        failed_tx,
+        MsgpackProposal{
+            .last_observed_transaction = 25,
+            .read_set = {"A"},
+            .writes = {
+                MsgpackWrite{.key = "A", .op = "put_if", .meta = {}, .payload = {static_cast<uint8_t>('9'), static_cast<uint8_t>('9')}},
+            },
+        }));
+
+    OUTCOME_TRYV(run_loop(CoordOptions{.root = root, .epoch = epoch, .interval = std::chrono::milliseconds{1}, .batch_limit = 16, .once = true}));
+    OUTCOME_TRYV(canonical->refresh());
+    OUTCOME_TRY(auto failure_seen, canonical_has_tx(*canonical, failed_tx, kFailedKey, kFailedPayload));
+    if (!failure_seen) {
+        std::filesystem::remove_all(root);
+        return filelog::Error::bad_argument;
+    }
+    std::filesystem::remove(proposals_dir / "writer-fail.log");
+
+    if (std::filesystem::exists(proposals_dir / "writer-success.log") ||
+        std::filesystem::exists(proposals_dir / "writer-fail.log")) {
+        std::filesystem::remove_all(root);
+        return filelog::Error::bad_argument;
+    }
+
+    std::filesystem::remove_all(root);
+    return outcome::success();
+}
+
+} // namespace
+
+outcome::status_result<void> run_epoch_once(std::filesystem::path root,
+                                            std::string epoch,
+                                            std::size_t batch_limit,
+                                            bool quiet) {
+    return run_loop(CoordOptions{
+        .root = std::move(root),
+        .epoch = std::move(epoch),
+        .interval = std::chrono::milliseconds{1},
+        .batch_limit = batch_limit,
+        .once = true,
+        .quiet = quiet,
+    });
+}
+
+outcome::status_result<void> run_integration_test() {
+    return proposer_committer_integration_test();
+}
+
+int run(int argc, char** argv) {
+    const auto options = parse_coord_options(argc, argv);
+    auto result = run_loop(options);
+    if (!result) {
+        std::cerr << "coordinator failed: " << result.error().message() << '\n';
+        return 1;
+    }
     return 0;
 }
 

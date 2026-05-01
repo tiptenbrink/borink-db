@@ -32,6 +32,10 @@
 #include "log.hpp"
 #include "log_api.hpp"
 
+namespace borinkdb::coordinator {
+OUTCOME_V2_NAMESPACE::experimental::status_result<void> run_integration_test();
+}
+
 namespace {
 
 namespace llfio = LLFIO_V2_NAMESPACE;
@@ -1250,6 +1254,7 @@ outcome::status_result<void> run_tests() {
     OUTCOME_TRYV(split_payload_limit_stress_test());
     OUTCOME_TRYV(encode_size_limit_test());
     OUTCOME_TRYV(grouped_payload_limit_test());
+    OUTCOME_TRYV(borinkdb::coordinator::run_integration_test());
 #if defined(BORINKDB_DEBUG_TESTS) && !defined(_WIN32)
     OUTCOME_TRYV(debug_expired_owner_invalidates_view_process_test());
     OUTCOME_TRYV(multiprocess_open_create_same_file_test());
@@ -1260,9 +1265,17 @@ outcome::status_result<void> run_tests() {
 
 }
 
+namespace borinkdb::coordinator {
+int run(int argc, char** argv);
+OUTCOME_V2_NAMESPACE::experimental::status_result<void> run_integration_test();
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && std::string_view{argv[1]} == "--bench") {
         return borinkdb::bench::run(argc, argv);
+    }
+    if (argc > 1 && std::string_view{argv[1]} == "--coordinator") {
+        return borinkdb::coordinator::run(argc, argv);
     }
 
     auto result = run_tests();

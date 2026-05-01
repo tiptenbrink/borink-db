@@ -16,6 +16,7 @@ constexpr std::size_t kReservedSize = 1;
 constexpr std::size_t kFlagsSize = 1;
 constexpr std::size_t kIdHiLenSize = 1;
 constexpr std::size_t kIdLoSize = 8;
+constexpr std::size_t kTransactionRefSize = 16;
 constexpr std::size_t kGroupFieldsSize = 4;
 constexpr std::size_t kEntryCountSize = 2;
 constexpr std::size_t kKeyLenSize = 2;
@@ -68,11 +69,15 @@ outcome::status_result<byteview> mapped_bytes(llfio::mapped_file_handle& mapped_
 
 LogRecordView::LogRecordView(uint64_t id_hi,
                              uint64_t id_lo,
+                             uint64_t transaction_ref_hi,
+                             uint64_t transaction_ref_lo,
                              uint16_t group_index,
                              byteview meta_bytes,
                              PayloadBlockList payload_blocks)
     : id_hi_(id_hi),
       id_lo_(id_lo),
+      transaction_ref_hi_(transaction_ref_hi),
+      transaction_ref_lo_(transaction_ref_lo),
       group_index_(group_index),
       meta_bytes_(meta_bytes),
       payload_blocks_(std::move(payload_blocks)) {}
@@ -127,7 +132,7 @@ outcome::status_result<std::vector<std::byte>> encode_block(const EncodeRequest&
 
     const std::size_t id_hi_len = detail::varuint_byte_length(req.id_hi);
     const std::size_t total =
-        kFixedHeaderPrefix + id_hi_len + kIdLoSize + kGroupFieldsSize + kEntryCountSize +
+        kFixedHeaderPrefix + id_hi_len + kIdLoSize + kTransactionRefSize + kGroupFieldsSize + kEntryCountSize +
         kCrcSize;
     std::size_t entries_size = 0;
     for (const auto& entry : entries) {
@@ -157,6 +162,8 @@ outcome::status_result<std::vector<std::byte>> encode_block(const EncodeRequest&
     *p++ = static_cast<std::byte>(id_hi_len);
     detail::write_varuint_le(p, req.id_hi, id_hi_len);
     detail::write_u64_le(p, req.id_lo);
+    detail::write_u64_le(p, req.transaction_ref_hi);
+    detail::write_u64_le(p, req.transaction_ref_lo);
     detail::write_u16_le(p, req.group.index);
     detail::write_u16_le(p, req.group.count);
 
@@ -178,7 +185,7 @@ outcome::status_result<std::vector<std::byte>> encode_block(const EncodeRequest&
 
 outcome::status_result<DecodedBlock> decode_block(byteview input) {
     constexpr std::size_t min_size =
-        kFixedHeaderPrefix + 1 + kIdLoSize + kGroupFieldsSize + kEntryCountSize + kEntryHeaderSize + kCrcSize;
+        kFixedHeaderPrefix + 1 + kIdLoSize + kTransactionRefSize + kGroupFieldsSize + kEntryCountSize + kEntryHeaderSize + kCrcSize;
     if (input.size() < min_size) {
         return Error::truncated_block;
     }
@@ -203,13 +210,15 @@ outcome::status_result<DecodedBlock> decode_block(byteview input) {
     const std::byte* p = input.data() + kFixedHeaderPrefix;
     const std::byte* const end_excl_crc = input.data() + (total_len - kCrcSize);
     const std::size_t fixed_body =
-        id_hi_len + kIdLoSize + kGroupFieldsSize + kEntryCountSize;
+        id_hi_len + kIdLoSize + kTransactionRefSize + kGroupFieldsSize + kEntryCountSize;
     if (p + fixed_body > end_excl_crc) {
         return Error::malformed_block;
     }
 
     const uint64_t id_hi = detail::read_varuint_le(p, id_hi_len);
     const uint64_t id_lo = detail::read_u64_le(p);
+    const uint64_t transaction_ref_hi = detail::read_u64_le(p);
+    const uint64_t transaction_ref_lo = detail::read_u64_le(p);
 
     GroupInfo group;
     group.index = detail::read_u16_le(p);
@@ -271,6 +280,8 @@ outcome::status_result<DecodedBlock> decode_block(byteview input) {
     return DecodedBlock{
         .id_hi = id_hi,
         .id_lo = id_lo,
+        .transaction_ref_hi = transaction_ref_hi,
+        .transaction_ref_lo = transaction_ref_lo,
         .group = group,
         .key = entries.front().key,
         .meta_bytes = entries.front().meta_bytes,
@@ -445,14 +456,19 @@ outcome::status_result<void> LogFile::write_block(byteview bytes) {
 }
 
 outcome::status_result<CommitResult> LogFile::commit_transaction(std::span<const TransactionEntry> entries) {
+    return commit_transaction(entries, CommitOptions{});
+}
+
+outcome::status_result<CommitResult> LogFile::commit_transaction(std::span<const TransactionEntry> entries,
+                                                                 const CommitOptions& options) {
     std::lock_guard lock(mutex_);
     if (entries.empty()) {
         return Error::bad_argument;
     }
 
     OUTCOME_TRYV(refresh_index());
-    const uint64_t our_id_hi = rng_();
-    const uint64_t our_id_lo = rng_();
+    const uint64_t our_id_hi = options.id ? options.id->id_hi : rng_();
+    const uint64_t our_id_lo = options.id ? options.id->id_lo : rng_();
 
     std::vector<std::vector<BlockEntry>> blocks;
     std::vector<BlockEntry> current_block;
@@ -472,6 +488,8 @@ outcome::status_result<CommitResult> LogFile::commit_transaction(std::span<const
             .key = {},
             .meta_bytes = {},
             .payload_bytes = {},
+            .transaction_ref_hi = options.transaction_ref.id_hi,
+            .transaction_ref_lo = options.transaction_ref.id_lo,
             .entries = candidate,
         });
         if (encoded) {
@@ -543,6 +561,8 @@ outcome::status_result<CommitResult> LogFile::commit_transaction(std::span<const
             .key = {},
             .meta_bytes = {},
             .payload_bytes = {},
+            .transaction_ref_hi = options.transaction_ref.id_hi,
+            .transaction_ref_lo = options.transaction_ref.id_lo,
             .entries = blocks[index],
         }));
         OUTCOME_TRYV(write_block(encoded));
@@ -803,7 +823,13 @@ outcome::status_result<LogRecordView> LogFile::record_view_at(uint64_t file_offs
             }
         }));
 
-    return LogRecordView(first_block.id_hi, first_block.id_lo, first_block.group.index, first_entry.meta_bytes, std::move(payload_blocks));
+    return LogRecordView(first_block.id_hi,
+                         first_block.id_lo,
+                         first_block.transaction_ref_hi,
+                         first_block.transaction_ref_lo,
+                         first_block.group.index,
+                         first_entry.meta_bytes,
+                         std::move(payload_blocks));
 }
 
 outcome::status_result<std::optional<LogRecordView>> LogFile::get_record_view(std::string_view key, LogReadMode mode) {

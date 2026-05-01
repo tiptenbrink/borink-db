@@ -118,9 +118,11 @@ struct EncodeRequest {
     uint64_t id_lo;
     GroupInfo group;
 
-    std::string_view key;
-    byteview meta_bytes;
-    byteview payload_bytes;
+    std::string_view key = {};
+    byteview meta_bytes = {};
+    byteview payload_bytes = {};
+    uint64_t transaction_ref_hi = 0;
+    uint64_t transaction_ref_lo = 0;
     std::span<const BlockEntry> entries = {};
 };
 
@@ -133,6 +135,8 @@ struct DecodedEntry {
 struct DecodedBlock {
     uint64_t id_hi;
     uint64_t id_lo;
+    uint64_t transaction_ref_hi;
+    uint64_t transaction_ref_lo;
     GroupInfo group;
     std::string_view key;
     byteview meta_bytes;
@@ -147,6 +151,11 @@ outcome::status_result<DecodedBlock>           decode_block(byteview input);
 struct CommitResult {
     uint64_t id_hi;
     uint64_t id_lo;
+};
+
+struct CommitOptions {
+    std::optional<CommitResult> id;
+    CommitResult transaction_ref{};
 };
 
 struct TransactionEntry {
@@ -184,6 +193,8 @@ public:
 
     [[nodiscard]] uint64_t id_hi() const noexcept { return id_hi_; }
     [[nodiscard]] uint64_t id_lo() const noexcept { return id_lo_; }
+    [[nodiscard]] uint64_t transaction_ref_hi() const noexcept { return transaction_ref_hi_; }
+    [[nodiscard]] uint64_t transaction_ref_lo() const noexcept { return transaction_ref_lo_; }
     [[nodiscard]] uint16_t group_index() const noexcept { return group_index_; }
     [[nodiscard]] byteview meta_bytes() const noexcept { return meta_bytes_; }
     [[nodiscard]] std::span<const byteview> payload_blocks() const noexcept {
@@ -193,10 +204,18 @@ public:
 private:
     friend class LogFile;
 
-    LogRecordView(uint64_t id_hi, uint64_t id_lo, uint16_t group_index, byteview meta_bytes, PayloadBlockList payload_blocks);
+    LogRecordView(uint64_t id_hi,
+                  uint64_t id_lo,
+                  uint64_t transaction_ref_hi,
+                  uint64_t transaction_ref_lo,
+                  uint16_t group_index,
+                  byteview meta_bytes,
+                  PayloadBlockList payload_blocks);
 
     uint64_t id_hi_ = 0;
     uint64_t id_lo_ = 0;
+    uint64_t transaction_ref_hi_ = 0;
+    uint64_t transaction_ref_lo_ = 0;
     uint16_t group_index_ = 0;
     byteview meta_bytes_;
     PayloadBlockList payload_blocks_;
@@ -258,6 +277,8 @@ public:
     ~LogFile();
 
     outcome::status_result<CommitResult> commit_transaction(std::span<const TransactionEntry> entries);
+    outcome::status_result<CommitResult> commit_transaction(std::span<const TransactionEntry> entries,
+                                                            const CommitOptions& options);
 
     // Returns a borrowed log record view. Keep LogFile alive longer than any
     // view returned from it.
